@@ -107,6 +107,8 @@ class PPO:
 
         # Initialize the combined policy-value network
         self.network = PolicyValueNetwork(num_stocks=self.num_stocks, num_products=self.num_products)
+        self.network.to(self.device)  # Move network to GPU
+    
         self.actor_optim = Adam(self.network.parameters(), lr=self.lr)
         self.critic_optim = Adam(self.network.parameters(), lr=self.lr)  # same network, but you could separate if desired
 

@@ -8,7 +8,7 @@ import sys
 import torch
 
 from arguments import get_args
-from ppo import PPO
+from ppo import PPO, PolicyValueNetwork
 from network import FeedForwardNN
 from eval_policy import eval_policy
 
@@ -67,12 +67,15 @@ def test(env, actor_model):
 		print(f"Didn't specify model file. Exiting.", flush=True)
 		sys.exit(0)
 
-	# Extract out dimensions of observation and action spaces
-	obs_dim = env.observation_space.shape[0]
-	act_dim = env.action_space.shape[0]
+	observation, _ = env.reset()
+
+	# Extract out dimensions of observation and action spacesv
+	num_stocks = len(observation["stocks"])
+	max_h, max_w = observation["stocks"][0].shape
+	num_products = len(observation["products"])
 
 	# Build our policy the same way we build our actor model in PPO
-	policy = FeedForwardNN(obs_dim, act_dim)
+	policy = PolicyValueNetwork(num_stocks=num_stocks, num_products=num_products)
 
 	# Load in the actor model saved by the PPO algorithm
 	policy.load_state_dict(torch.load(actor_model))
