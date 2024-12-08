@@ -234,7 +234,7 @@ class PPO:
                 products_tensor = torch.tensor(products_array, dtype=torch.float).unsqueeze(0)  # Shape: (1, num_products, 3)
 
                 # Convert to torch
-                stocks_tensor = torch.tensor(stocks_np, dtype=torch.float).unsqueeze(0)    # (1, num_stocks, 100, 100)
+                stocks_tensor = torch.tensor(np.array(stocks_np), dtype=torch.float).unsqueeze(0)    # (1, num_stocks, 100, 100)
                 # products_tensor = torch.tensor(products_np, dtype=torch.float).unsqueeze(0) # (1, num_products, 3)
 
                 stock_action, product_action, log_prob = self.get_action(stocks_tensor, products_tensor)
@@ -261,8 +261,8 @@ class PPO:
             batch_rews.append(ep_rews)
 
         # Convert to tensors
-        batch_stocks = torch.tensor(batch_stocks, dtype=torch.float)   # (N, num_stocks, 100, 100)
-        batch_products = torch.tensor(batch_products, dtype=torch.float) # (N, num_products, 3)
+        batch_stocks = torch.tensor(np.array(batch_stocks), dtype=torch.float)   # (N, num_stocks, 100, 100)
+        batch_products = torch.tensor(np.array(batch_products), dtype=torch.float) # (N, num_products, 3)
         batch_acts = torch.tensor(batch_acts, dtype=torch.long)          # (N, 2) where [:,0]=stock_id, [:,1]=product_id
         batch_log_probs = torch.tensor(batch_log_probs, dtype=torch.float)
 
