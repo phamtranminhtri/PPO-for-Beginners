@@ -87,6 +87,10 @@ class PolicyValueNetwork(nn.Module):
 # ----------------------------------------------------
 class PPO:
     def __init__(self, env, **hyperparameters):
+        # Check GPU availability
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {self.device}")
+        
         self._init_hyperparameters(hyperparameters)
         observation, _ = env.reset()
         self.env = env
@@ -231,11 +235,14 @@ class PPO:
                 products_array = np.array(products_list)  # Shape: (num_products, 3)
 
                 # Convert to torch tensor
-                products_tensor = torch.tensor(products_array, dtype=torch.float).unsqueeze(0)  # Shape: (1, num_products, 3)
+                # products_tensor = torch.tensor(products_array, dtype=torch.float).unsqueeze(0)  # Shape: (1, num_products, 3)
 
-                # Convert to torch
-                stocks_tensor = torch.tensor(np.array(stocks_np), dtype=torch.float).unsqueeze(0)    # (1, num_stocks, 100, 100)
+                # # Convert to torch
+                # stocks_tensor = torch.tensor(np.array(stocks_np), dtype=torch.float).unsqueeze(0)    # (1, num_stocks, 100, 100)
                 # products_tensor = torch.tensor(products_np, dtype=torch.float).unsqueeze(0) # (1, num_products, 3)
+
+                stocks_tensor = torch.tensor(np.array(stocks_np), dtype=torch.float).unsqueeze(0).to(self.device)
+                products_tensor = torch.tensor(products_array, dtype=torch.float).unsqueeze(0).to(self.device)
 
                 stock_action, product_action, log_prob = self.get_action(stocks_tensor, products_tensor)
 
@@ -261,12 +268,18 @@ class PPO:
             batch_rews.append(ep_rews)
 
         # Convert to tensors
-        batch_stocks = torch.tensor(np.array(batch_stocks), dtype=torch.float)   # (N, num_stocks, 100, 100)
-        batch_products = torch.tensor(np.array(batch_products), dtype=torch.float) # (N, num_products, 3)
-        batch_acts = torch.tensor(batch_acts, dtype=torch.long)          # (N, 2) where [:,0]=stock_id, [:,1]=product_id
-        batch_log_probs = torch.tensor(batch_log_probs, dtype=torch.float)
+        # batch_stocks = torch.tensor(np.array(batch_stocks), dtype=torch.float)   # (N, num_stocks, 100, 100)
+        # batch_products = torch.tensor(np.array(batch_products), dtype=torch.float) # (N, num_products, 3)
+        # batch_acts = torch.tensor(batch_acts, dtype=torch.long)          # (N, 2) where [:,0]=stock_id, [:,1]=product_id
+        # batch_log_probs = torch.tensor(batch_log_probs, dtype=torch.float)
 
         batch_rtgs = self.compute_rtgs(batch_rews)
+        
+        batch_stocks = torch.tensor(np.array(batch_stocks), dtype=torch.float).to(self.device)
+        batch_products = torch.tensor(np.array(batch_products), dtype=torch.float).to(self.device) 
+        batch_acts = torch.tensor(batch_acts, dtype=torch.long).to(self.device)
+        batch_log_probs = torch.tensor(batch_log_probs, dtype=torch.float).to(self.device)
+        batch_rtgs = torch.tensor(batch_rtgs, dtype=torch.float).to(self.device)
 
         # Logging
         self.logger['batch_rews'] = batch_rews
