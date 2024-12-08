@@ -12,6 +12,8 @@ from ppo import PPO
 from network import FeedForwardNN
 from eval_policy import eval_policy
 
+import gym_cutting_stock
+
 def train(env, hyperparameters, actor_model, critic_model):
 	"""
 		Trains the model.
@@ -95,7 +97,7 @@ def main(args):
 	# ArgumentParser because it's too annoying to type them every time at command line. Instead, you can change them here.
 	# To see a list of hyperparameters, look in ppo.py at function _init_hyperparameters
 	hyperparameters = {
-				'timesteps_per_batch': 2048, 
+				'timesteps_per_batch': 200, # prev 2048
 				'max_timesteps_per_episode': 200, 
 				'gamma': 0.99, 
 				'n_updates_per_iteration': 10,
@@ -108,7 +110,15 @@ def main(args):
 	# Creates the environment we'll be running. If you want to replace with your own
 	# custom environment, note that it must inherit Gym and have both continuous
 	# observation and action spaces.
-	env = gym.make('Pendulum-v1', render_mode='human' if args.mode == 'test' else 'rgb_array')
+	# env = gym.make('Pendulum-v1', render_mode='human' if args.mode == 'test' else 'rgb_array')
+	# env = gym.make('LunarLander-v2', render_mode='human' if args.mode == 'test' else 'rgb_array')
+	env = gym.make(
+    	"gym_cutting_stock/CuttingStock-v0", 
+     	render_mode='human' if args.mode == 'test' else 'rgb_array',
+		num_stocks=16,
+		max_product_type=3,
+        max_product_per_type=5,
+	)
 
 	# Train or test, depending on the mode specified
 	if args.mode == 'train':

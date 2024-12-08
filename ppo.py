@@ -1,402 +1,416 @@
-"""
-	The file contains the PPO class to train with.
-	NOTE: All "ALG STEP"s are following the numbers from the original PPO pseudocode.
-			It can be found here: https://spinningup.openai.com/en/latest/_images/math/e62a8971472597f4b014c2da064f636ffe365ba3.svg
-"""
-
 import gymnasium as gym
 import time
 
 import numpy as np
-import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import Adam
-from torch.distributions import MultivariateNormal
+from torch.distributions import Categorical
 
+# ----------------------------------------------------
+# CNN-based PolicyValueNetwork as described previously
+# ----------------------------------------------------
+class StockCNNEncoder(nn.Module):
+    def __init__(self):
+        super(StockCNNEncoder, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=8, stride=4)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
+        self.fc = nn.Linear(64 * 9 * 9, 128)  # Adjust if exact shape differs
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc(x))
+        return x
+
+class ProductEncoder(nn.Module):
+    def __init__(self, input_dim=3, hidden_dim=64, embed_dim=32):
+        super(ProductEncoder, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, embed_dim)
+
+    def forward(self, prod_features):
+        x = F.relu(self.fc1(prod_features))
+        x = F.relu(self.fc2(x))
+        return x
+
+class PolicyValueNetwork(nn.Module):
+    def __init__(self, num_stocks=100, num_products=20):
+        super(PolicyValueNetwork, self).__init__()
+        self.num_stocks = num_stocks
+        self.num_products = num_products
+
+        self.stock_encoder = StockCNNEncoder()
+        self.product_encoder = ProductEncoder()
+
+        # Policy and Value heads
+        self.stock_head = nn.Linear(160, num_stocks)
+        self.product_head = nn.Linear(160, num_products)
+        self.value_head = nn.Linear(160, 1)
+
+    def forward(self, stock_images, product_features):
+        # stock_images: (B, num_stocks, 100, 100)
+        # product_features: (B, num_products, 3)
+
+        B = stock_images.size(0)
+
+        # Process stocks
+        # Add a channel dimension: (B, num_stocks, 1, 100, 100)
+        stock_images = stock_images.unsqueeze(2)  # insert channel dimension
+        stock_images = stock_images.view(B * self.num_stocks, 1, 100, 100)
+        stock_embeds = self.stock_encoder(stock_images)  # (B*num_stocks, 128)
+        stock_embeds = stock_embeds.view(B, self.num_stocks, 128)
+
+        # Process products
+        product_features = product_features.view(B * self.num_products, 3)
+        product_embeds = self.product_encoder(product_features)  # (B*num_products, 32)
+        product_embeds = product_embeds.view(B, self.num_products, 32)
+
+        # Aggregate
+        stock_summary = stock_embeds.mean(dim=1)     # (B, 128)
+        product_summary = product_embeds.mean(dim=1) # (B, 32)
+        combined = torch.cat([stock_summary, product_summary], dim=-1)  # (B, 160)
+
+        stock_logits = self.stock_head(combined)       # (B, num_stocks)
+        product_logits = self.product_head(combined)   # (B, num_products)
+        value = self.value_head(combined)              # (B, 1)
+
+        return stock_logits, product_logits, value
+
+
+# ----------------------------------------------------
+# PPO class modified to use the above CNN architecture
+# ----------------------------------------------------
 class PPO:
-	"""
-		This is the PPO class we will use as our model in main.py
-	"""
-	def __init__(self, policy_class, env, **hyperparameters):
-		"""
-			Initializes the PPO model, including hyperparameters.
-
-			Parameters:
-				policy_class - the policy class to use for our actor/critic networks.
-				env - the environment to train on.
-				hyperparameters - all extra arguments passed into PPO that should be hyperparameters.
-
-			Returns:
-				None
-		"""
-		# Make sure the environment is compatible with our code
-		assert(type(env.observation_space) == gym.spaces.Box)
-		assert(type(env.action_space) == gym.spaces.Box)
-
-		# Initialize hyperparameters for training with PPO
-		self._init_hyperparameters(hyperparameters)
-
-		# Extract environment information
-		self.env = env
-		self.obs_dim = env.observation_space.shape[0]
-		self.act_dim = env.action_space.shape[0]
-
-		 # Initialize actor and critic networks
-		self.actor = policy_class(self.obs_dim, self.act_dim)                                                   # ALG STEP 1
-		self.critic = policy_class(self.obs_dim, 1)
-
-		# Initialize optimizers for actor and critic
-		self.actor_optim = Adam(self.actor.parameters(), lr=self.lr)
-		self.critic_optim = Adam(self.critic.parameters(), lr=self.lr)
-
-		# Initialize the covariance matrix used to query the actor for actions
-		self.cov_var = torch.full(size=(self.act_dim,), fill_value=0.5)
-		self.cov_mat = torch.diag(self.cov_var)
-
-		# This logger will help us with printing out summaries of each iteration
-		self.logger = {
-			'delta_t': time.time_ns(),
-			't_so_far': 0,          # timesteps so far
-			'i_so_far': 0,          # iterations so far
-			'batch_lens': [],       # episodic lengths in batch
-			'batch_rews': [],       # episodic returns in batch
-			'actor_losses': [],     # losses of actor network in current iteration
-		}
-
-	def learn(self, total_timesteps):
-		"""
-			Train the actor and critic networks. Here is where the main PPO algorithm resides.
-
-			Parameters:
-				total_timesteps - the total number of timesteps to train for
-
-			Return:
-				None
-		"""
-		print(f"Learning... Running {self.max_timesteps_per_episode} timesteps per episode, ", end='')
-		print(f"{self.timesteps_per_batch} timesteps per batch for a total of {total_timesteps} timesteps")
-		t_so_far = 0 # Timesteps simulated so far
-		i_so_far = 0 # Iterations ran so far
-		while t_so_far < total_timesteps:                                                                       # ALG STEP 2
-			# Autobots, roll out (just kidding, we're collecting our batch simulations here)
-			batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_lens = self.rollout()                     # ALG STEP 3
-
-			# Calculate how many timesteps we collected this batch
-			t_so_far += np.sum(batch_lens)
-
-			# Increment the number of iterations
-			i_so_far += 1
-
-			# Logging timesteps so far and iterations so far
-			self.logger['t_so_far'] = t_so_far
-			self.logger['i_so_far'] = i_so_far
-
-			# Calculate advantage at k-th iteration
-			V, _ = self.evaluate(batch_obs, batch_acts)
-			A_k = batch_rtgs - V.detach()                                                                       # ALG STEP 5
-
-			# One of the only tricks I use that isn't in the pseudocode. Normalizing advantages
-			# isn't theoretically necessary, but in practice it decreases the variance of 
-			# our advantages and makes convergence much more stable and faster. I added this because
-			# solving some environments was too unstable without it.
-			A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
-
-			# This is the loop where we update our network for some n epochs
-			for _ in range(self.n_updates_per_iteration):                                                       # ALG STEP 6 & 7
-				# Calculate V_phi and pi_theta(a_t | s_t)
-				V, curr_log_probs = self.evaluate(batch_obs, batch_acts)
-
-				# Calculate the ratio pi_theta(a_t | s_t) / pi_theta_k(a_t | s_t)
-				# NOTE: we just subtract the logs, which is the same as
-				# dividing the values and then canceling the log with e^log.
-				# For why we use log probabilities instead of actual probabilities,
-				# here's a great explanation: 
-				# https://cs.stackexchange.com/questions/70518/why-do-we-use-the-log-in-gradient-based-reinforcement-algorithms
-				# TL;DR makes gradient ascent easier behind the scenes.
-				ratios = torch.exp(curr_log_probs - batch_log_probs)
-
-				# Calculate surrogate losses.
-				surr1 = ratios * A_k
-				surr2 = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * A_k
-
-				# Calculate actor and critic losses.
-				# NOTE: we take the negative min of the surrogate losses because we're trying to maximize
-				# the performance function, but Adam minimizes the loss. So minimizing the negative
-				# performance function maximizes it.
-				actor_loss = (-torch.min(surr1, surr2)).mean()
-				critic_loss = nn.MSELoss()(V, batch_rtgs)
-
-				# Calculate gradients and perform backward propagation for actor network
-				self.actor_optim.zero_grad()
-				actor_loss.backward(retain_graph=True)
-				self.actor_optim.step()
-
-				# Calculate gradients and perform backward propagation for critic network
-				self.critic_optim.zero_grad()
-				critic_loss.backward()
-				self.critic_optim.step()
-
-				# Log actor loss
-				self.logger['actor_losses'].append(actor_loss.detach())
-
-			# Print a summary of our training so far
-			self._log_summary()
-
-			# Save our model if it's time
-			if i_so_far % self.save_freq == 0:
-				torch.save(self.actor.state_dict(), './ppo_actor.pth')
-				torch.save(self.critic.state_dict(), './ppo_critic.pth')
-
-	def rollout(self):
-		"""
-			Too many transformers references, I'm sorry. This is where we collect the batch of data
-			from simulation. Since this is an on-policy algorithm, we'll need to collect a fresh batch
-			of data each time we iterate the actor/critic networks.
-
-			Parameters:
-				None
-
-			Return:
-				batch_obs - the observations collected this batch. Shape: (number of timesteps, dimension of observation)
-				batch_acts - the actions collected this batch. Shape: (number of timesteps, dimension of action)
-				batch_log_probs - the log probabilities of each action taken this batch. Shape: (number of timesteps)
-				batch_rtgs - the Rewards-To-Go of each timestep in this batch. Shape: (number of timesteps)
-				batch_lens - the lengths of each episode this batch. Shape: (number of episodes)
-		"""
-		# Batch data. For more details, check function header.
-		batch_obs = []
-		batch_acts = []
-		batch_log_probs = []
-		batch_rews = []
-		batch_rtgs = []
-		batch_lens = []
-
-		# Episodic data. Keeps track of rewards per episode, will get cleared
-		# upon each new episode
-		ep_rews = []
-
-		t = 0 # Keeps track of how many timesteps we've run so far this batch
-
-		# Keep simulating until we've run more than or equal to specified timesteps per batch
-		while t < self.timesteps_per_batch:
-			ep_rews = [] # rewards collected per episode
-
-			# Reset the environment. sNote that obs is short for observation. 
-			obs, _ = self.env.reset()
-			done = False
-
-			# Run an episode for a maximum of max_timesteps_per_episode timesteps
-			for ep_t in range(self.max_timesteps_per_episode):
-				# If render is specified, render the environment
-				if self.render and (self.logger['i_so_far'] % self.render_every_i == 0) and len(batch_lens) == 0:
-					self.env.render()
-
-				t += 1 # Increment timesteps ran this batch so far
-
-				# Track observations in this batch
-				batch_obs.append(obs)
-
-				# Calculate action and make a step in the env. 
-				# Note that rew is short for reward.
-				action, log_prob = self.get_action(obs)
-				obs, rew, terminated, truncated, _ = self.env.step(action)
-
-				# Don't really care about the difference between terminated or truncated in this, so just combine them
-				done = terminated | truncated
-
-				# Track recent reward, action, and action log probability
-				ep_rews.append(rew)
-				batch_acts.append(action)
-				batch_log_probs.append(log_prob)
-
-				# If the environment tells us the episode is terminated, break
-				if done:
-					break
-
-			# Track episodic lengths and rewards
-			batch_lens.append(ep_t + 1)
-			batch_rews.append(ep_rews)
-
-		# Reshape data as tensors in the shape specified in function description, before returning
-		batch_obs = torch.tensor(batch_obs, dtype=torch.float)
-		batch_acts = torch.tensor(batch_acts, dtype=torch.float)
-		batch_log_probs = torch.tensor(batch_log_probs, dtype=torch.float)
-		batch_rtgs = self.compute_rtgs(batch_rews)                                                              # ALG STEP 4
-
-		# Log the episodic returns and episodic lengths in this batch.
-		self.logger['batch_rews'] = batch_rews
-		self.logger['batch_lens'] = batch_lens
-
-		return batch_obs, batch_acts, batch_log_probs, batch_rtgs, batch_lens
-
-	def compute_rtgs(self, batch_rews):
-		"""
-			Compute the Reward-To-Go of each timestep in a batch given the rewards.
-
-			Parameters:
-				batch_rews - the rewards in a batch, Shape: (number of episodes, number of timesteps per episode)
-
-			Return:
-				batch_rtgs - the rewards to go, Shape: (number of timesteps in batch)
-		"""
-		# The rewards-to-go (rtg) per episode per batch to return.
-		# The shape will be (num timesteps per episode)
-		batch_rtgs = []
-
-		# Iterate through each episode
-		for ep_rews in reversed(batch_rews):
-
-			discounted_reward = 0 # The discounted reward so far
-
-			# Iterate through all rewards in the episode. We go backwards for smoother calculation of each
-			# discounted return (think about why it would be harder starting from the beginning)
-			for rew in reversed(ep_rews):
-				discounted_reward = rew + discounted_reward * self.gamma
-				batch_rtgs.insert(0, discounted_reward)
-
-		# Convert the rewards-to-go into a tensor
-		batch_rtgs = torch.tensor(batch_rtgs, dtype=torch.float)
-
-		return batch_rtgs
-
-	def get_action(self, obs):
-		"""
-			Queries an action from the actor network, should be called from rollout.
-
-			Parameters:
-				obs - the observation at the current timestep
-
-			Return:
-				action - the action to take, as a numpy array
-				log_prob - the log probability of the selected action in the distribution
-		"""
-		# Query the actor network for a mean action
-		mean = self.actor(obs)
-
-		# Create a distribution with the mean action and std from the covariance matrix above.
-		# For more information on how this distribution works, check out Andrew Ng's lecture on it:
-		# https://www.youtube.com/watch?v=JjB58InuTqM
-		dist = MultivariateNormal(mean, self.cov_mat)
-
-		# Sample an action from the distribution
-		action = dist.sample()
-
-		# Calculate the log probability for that action
-		log_prob = dist.log_prob(action)
-
-		# Return the sampled action and the log probability of that action in our distribution
-		return action.detach().numpy(), log_prob.detach()
-
-	def evaluate(self, batch_obs, batch_acts):
-		"""
-			Estimate the values of each observation, and the log probs of
-			each action in the most recent batch with the most recent
-			iteration of the actor network. Should be called from learn.
-
-			Parameters:
-				batch_obs - the observations from the most recently collected batch as a tensor.
-							Shape: (number of timesteps in batch, dimension of observation)
-				batch_acts - the actions from the most recently collected batch as a tensor.
-							Shape: (number of timesteps in batch, dimension of action)
-
-			Return:
-				V - the predicted values of batch_obs
-				log_probs - the log probabilities of the actions taken in batch_acts given batch_obs
-		"""
-		# Query critic network for a value V for each batch_obs. Shape of V should be same as batch_rtgs
-		V = self.critic(batch_obs).squeeze()
-
-		# Calculate the log probabilities of batch actions using most recent actor network.
-		# This segment of code is similar to that in get_action()
-		mean = self.actor(batch_obs)
-		dist = MultivariateNormal(mean, self.cov_mat)
-		log_probs = dist.log_prob(batch_acts)
-
-		# Return the value vector V of each observation in the batch
-		# and log probabilities log_probs of each action in the batch
-		return V, log_probs
-
-	def _init_hyperparameters(self, hyperparameters):
-		"""
-			Initialize default and custom values for hyperparameters
-
-			Parameters:
-				hyperparameters - the extra arguments included when creating the PPO model, should only include
-									hyperparameters defined below with custom values.
-
-			Return:
-				None
-		"""
-		# Initialize default values for hyperparameters
-		# Algorithm hyperparameters
-		self.timesteps_per_batch = 4800                 # Number of timesteps to run per batch
-		self.max_timesteps_per_episode = 1600           # Max number of timesteps per episode
-		self.n_updates_per_iteration = 5                # Number of times to update actor/critic per iteration
-		self.lr = 0.005                                 # Learning rate of actor optimizer
-		self.gamma = 0.95                               # Discount factor to be applied when calculating Rewards-To-Go
-		self.clip = 0.2                                 # Recommended 0.2, helps define the threshold to clip the ratio during SGA
-
-		# Miscellaneous parameters
-		self.render = True                              # If we should render during rollout
-		self.render_every_i = 10                        # Only render every n iterations
-		self.save_freq = 10                             # How often we save in number of iterations
-		self.seed = None                                # Sets the seed of our program, used for reproducibility of results
-
-		# Change any default values to custom values for specified hyperparameters
-		for param, val in hyperparameters.items():
-			exec('self.' + param + ' = ' + str(val))
-
-		# Sets the seed if specified
-		if self.seed != None:
-			# Check if our seed is valid first
-			assert(type(self.seed) == int)
-
-			# Set the seed 
-			torch.manual_seed(self.seed)
-			print(f"Successfully set seed to {self.seed}")
-
-	def _log_summary(self):
-		"""
-			Print to stdout what we've logged so far in the most recent batch.
-
-			Parameters:
-				None
-
-			Return:
-				None
-		"""
-		# Calculate logging values. I use a few python shortcuts to calculate each value
-		# without explaining since it's not too important to PPO; feel free to look it over,
-		# and if you have any questions you can email me (look at bottom of README)
-		delta_t = self.logger['delta_t']
-		self.logger['delta_t'] = time.time_ns()
-		delta_t = (self.logger['delta_t'] - delta_t) / 1e9
-		delta_t = str(round(delta_t, 2))
-
-		t_so_far = self.logger['t_so_far']
-		i_so_far = self.logger['i_so_far']
-		avg_ep_lens = np.mean(self.logger['batch_lens'])
-		avg_ep_rews = np.mean([np.sum(ep_rews) for ep_rews in self.logger['batch_rews']])
-		avg_actor_loss = np.mean([losses.float().mean() for losses in self.logger['actor_losses']])
-
-		# Round decimal places for more aesthetic logging messages
-		avg_ep_lens = str(round(avg_ep_lens, 2))
-		avg_ep_rews = str(round(avg_ep_rews, 2))
-		avg_actor_loss = str(round(avg_actor_loss, 5))
-
-		# Print logging statements
-		print(flush=True)
-		print(f"-------------------- Iteration #{i_so_far} --------------------", flush=True)
-		print(f"Average Episodic Length: {avg_ep_lens}", flush=True)
-		print(f"Average Episodic Return: {avg_ep_rews}", flush=True)
-		print(f"Average Loss: {avg_actor_loss}", flush=True)
-		print(f"Timesteps So Far: {t_so_far}", flush=True)
-		print(f"Iteration took: {delta_t} secs", flush=True)
-		print(f"------------------------------------------------------", flush=True)
-		print(flush=True)
-
-		# Reset batch-specific logging data
-		self.logger['batch_lens'] = []
-		self.logger['batch_rews'] = []
-		self.logger['actor_losses'] = []
+    def __init__(self, env, **hyperparameters):
+        self._init_hyperparameters(hyperparameters)
+        observation, _ = env.reset()
+        self.env = env
+        
+        # Extract environment info
+        # Assuming environment provides these dimensions
+        # self.num_stocks = len(env.observation_space['stocks'])
+        # self.num_products = env.observation_space['products'].feature_space['quantity'].n
+        # self.max_w, self.max_h = env.observation_space['stocks'][0].shape
+    
+        self.num_stocks = len(observation["stocks"])
+        self.max_h, self.max_w = observation["stocks"][0].shape
+        self.num_products = len(observation["products"])
+
+        # Initialize the combined policy-value network
+        self.network = PolicyValueNetwork(num_stocks=self.num_stocks, num_products=self.num_products)
+        self.actor_optim = Adam(self.network.parameters(), lr=self.lr)
+        self.critic_optim = Adam(self.network.parameters(), lr=self.lr)  # same network, but you could separate if desired
+
+        # Logger
+        self.logger = {
+            'delta_t': time.time_ns(),
+            't_so_far': 0,
+            'i_so_far': 0,
+            'batch_lens': [],
+            'batch_rews': [],
+            'actor_losses': [],
+        }
+
+    def learn(self, total_timesteps):
+        print(f"Learning... {self.max_timesteps_per_episode} steps/ep, {self.timesteps_per_batch} steps/batch, total {total_timesteps} steps")
+        t_so_far = 0
+        i_so_far = 0
+        while t_so_far < total_timesteps:
+            batch_obs, batch_stocks, batch_products, batch_acts, batch_log_probs, batch_rtgs, batch_lens = self.rollout()
+
+            t_so_far += np.sum(batch_lens)
+            i_so_far += 1
+            self.logger['t_so_far'] = t_so_far
+            self.logger['i_so_far'] = i_so_far
+
+            # Evaluate old actions and values
+            V, curr_log_probs = self.evaluate(batch_stocks, batch_products, batch_acts)
+            A_k = batch_rtgs - V.detach()
+            A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
+
+            # Update network
+            for _ in range(self.n_updates_per_iteration):
+                # V, curr_log_probs = self.evaluate(batch_stocks, batch_products, batch_acts)
+
+                # ratios = torch.exp(curr_log_probs - batch_log_probs)
+                # surr1 = ratios * A_k
+                # surr2 = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * A_k
+
+                # actor_loss = (-torch.min(surr1, surr2)).mean()
+                # critic_loss = nn.MSELoss()(V, batch_rtgs)
+
+                # self.actor_optim.zero_grad()
+                # actor_loss.backward(retain_graph=True)
+                # self.actor_optim.step()
+
+                # self.critic_optim.zero_grad()
+                # critic_loss.backward()
+                # self.critic_optim.step()
+
+                # self.logger['actor_losses'].append(actor_loss.detach())
+                
+                
+                # o1 fix
+                # Zero gradients
+                self.actor_optim.zero_grad()
+
+                # Evaluate current values and log probabilities
+                V, curr_log_probs = self.evaluate(batch_stocks, batch_products, batch_acts)
+
+                # Calculate advantages
+                # A_k = batch_rtgs - V.detach()
+                # A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
+
+                # Calculate ratios
+                ratios = torch.exp(curr_log_probs - batch_log_probs)
+
+                # Calculate surrogate losses
+                surr1 = ratios * A_k
+                surr2 = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * A_k
+
+                # Compute actor and critic losses
+                actor_loss = (-torch.min(surr1, surr2)).mean()
+                critic_loss = nn.MSELoss()(V, batch_rtgs)
+
+                # Combine losses
+                total_loss = actor_loss + critic_loss
+
+                # Backward pass
+                total_loss.backward()
+
+                # Optimizer step
+                self.actor_optim.step()
+
+                # Log the losses
+                self.logger['actor_losses'].append(actor_loss.detach())
+
+            self._log_summary()
+
+            if i_so_far % self.save_freq == 0:
+                torch.save(self.network.state_dict(), './ppo_cnn_policy_value.pth')
+
+    def rollout(self):
+        batch_obs = []
+        batch_stocks = []
+        batch_products = []
+        batch_acts = []
+        batch_log_probs = []
+        batch_rews = []
+        batch_rtgs = []
+        batch_lens = []
+
+        t = 0
+        while t < self.timesteps_per_batch:
+            ep_rews = []
+            obs, _ = self.env.reset()
+            done = False
+
+            for ep_t in range(self.max_timesteps_per_episode):
+                if self.render and (self.logger['i_so_far'] % self.render_every_i == 0) and len(batch_lens) == 0:
+                    self.env.render()
+
+                # Extract observation components
+                stocks_np = obs['stocks']  # shape (num_stocks, 100, 100)
+                products_np = obs['products']  # shape (num_products, 3)
+                
+                # Extract numerical data from products_np
+                products_list = []
+                for product in products_np:
+                    size = product['size']  # numpy array, e.g., array([33, 42])
+                    quantity = product['quantity']  # integer, e.g., 12
+                    # Combine size and quantity into a single array
+                    product_features = np.concatenate((size, [quantity]))
+                    products_list.append(product_features)
+
+                # Convert the list to a numpy array
+                products_array = np.array(products_list)  # Shape: (num_products, 3)
+
+                # Convert to torch tensor
+                products_tensor = torch.tensor(products_array, dtype=torch.float).unsqueeze(0)  # Shape: (1, num_products, 3)
+
+                # Convert to torch
+                stocks_tensor = torch.tensor(stocks_np, dtype=torch.float).unsqueeze(0)    # (1, num_stocks, 100, 100)
+                # products_tensor = torch.tensor(products_np, dtype=torch.float).unsqueeze(0) # (1, num_products, 3)
+
+                stock_action, product_action, log_prob = self.get_action(stocks_tensor, products_tensor)
+
+                # Store data
+                batch_obs.append(obs)
+                batch_stocks.append(stocks_np)
+                batch_products.append(products_array)
+                batch_acts.append([stock_action, product_action])
+                batch_log_probs.append(log_prob)
+
+                action = self.greedy(stocks_np, stock_action, products_np[product_action]['size'])
+
+                obs, rew, terminated, truncated, info = self.env.step(action)
+                rew = -info['trim_loss']
+                done = terminated or truncated
+                ep_rews.append(rew)
+                t += 1
+
+                if done:
+                    break
+
+            batch_lens.append(ep_t + 1)
+            batch_rews.append(ep_rews)
+
+        # Convert to tensors
+        batch_stocks = torch.tensor(batch_stocks, dtype=torch.float)   # (N, num_stocks, 100, 100)
+        batch_products = torch.tensor(batch_products, dtype=torch.float) # (N, num_products, 3)
+        batch_acts = torch.tensor(batch_acts, dtype=torch.long)          # (N, 2) where [:,0]=stock_id, [:,1]=product_id
+        batch_log_probs = torch.tensor(batch_log_probs, dtype=torch.float)
+
+        batch_rtgs = self.compute_rtgs(batch_rews)
+
+        # Logging
+        self.logger['batch_rews'] = batch_rews
+        self.logger['batch_lens'] = batch_lens
+
+        return batch_obs, batch_stocks, batch_products, batch_acts, batch_log_probs, batch_rtgs, batch_lens
+
+    def compute_rtgs(self, batch_rews):
+        batch_rtgs = []
+        for ep_rews in reversed(batch_rews):
+            discounted_reward = 0
+            for rew in reversed(ep_rews):
+                discounted_reward = rew + self.gamma * discounted_reward
+                batch_rtgs.insert(0, discounted_reward)
+        return torch.tensor(batch_rtgs, dtype=torch.float)
+
+    def get_action(self, stocks_tensor, products_tensor):
+        # Forward pass through network
+        stock_logits, product_logits, value = self.network(stocks_tensor, products_tensor)
+
+        # Create distributions
+        stock_dist = Categorical(logits=stock_logits)
+        product_dist = Categorical(logits=product_logits)
+
+        stock_action = stock_dist.sample()
+        product_action = product_dist.sample()
+
+        log_prob = stock_dist.log_prob(stock_action) + product_dist.log_prob(product_action)
+
+        return stock_action.item(), product_action.item(), log_prob.item()
+
+    def evaluate(self, batch_stocks, batch_products, batch_acts):
+        # batch_stocks: (N, num_stocks, 100, 100)
+        # batch_products: (N, num_products, 3)
+        # batch_acts: (N, 2) where columns are stock_id, product_id
+        stock_logits, product_logits, value = self.network(batch_stocks, batch_products)
+
+        stock_dist = Categorical(logits=stock_logits)
+        product_dist = Categorical(logits=product_logits)
+
+        stock_actions = batch_acts[:, 0]
+        product_actions = batch_acts[:, 1]
+
+        stock_log_probs = stock_dist.log_prob(stock_actions)
+        product_log_probs = product_dist.log_prob(product_actions)
+
+        log_probs = stock_log_probs + product_log_probs
+
+        return value.squeeze(), log_probs
+
+    def _init_hyperparameters(self, hyperparameters):
+        self.timesteps_per_batch = 4800
+        self.max_timesteps_per_episode = 1600
+        self.n_updates_per_iteration = 5
+        self.lr = 0.005
+        self.gamma = 0.95
+        self.clip = 0.2
+
+        self.render = True
+        self.render_every_i = 10
+        self.save_freq = 10
+        self.seed = None
+
+        for param, val in hyperparameters.items():
+            setattr(self, param, val)
+
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+            print(f"Seed set to {self.seed}")
+
+    def _log_summary(self):
+        delta_t = self.logger['delta_t']
+        self.logger['delta_t'] = time.time_ns()
+        delta_t = (self.logger['delta_t'] - delta_t) / 1e9
+        delta_t = str(round(delta_t, 2))
+
+        t_so_far = self.logger['t_so_far']
+        i_so_far = self.logger['i_so_far']
+        avg_ep_lens = np.mean(self.logger['batch_lens'])
+        avg_ep_rews = np.mean([np.sum(ep_rews) for ep_rews in self.logger['batch_rews']])
+        avg_actor_loss = np.mean([losses.float().mean() for losses in self.logger['actor_losses']])
+
+        avg_ep_lens = str(round(avg_ep_lens, 2))
+        avg_ep_rews = str(round(avg_ep_rews, 2))
+        avg_actor_loss = str(round(avg_actor_loss, 5))
+
+        print(flush=True)
+        print(f"-------------------- Iteration #{i_so_far} --------------------", flush=True)
+        print(f"Average Episodic Length: {avg_ep_lens}", flush=True)
+        print(f"Average Episodic Return: {avg_ep_rews}", flush=True)
+        print(f"Average Loss: {avg_actor_loss}", flush=True)
+        print(f"Timesteps So Far: {t_so_far}", flush=True)
+        print(f"Iteration took: {delta_t} secs", flush=True)
+        print("------------------------------------------------------", flush=True)
+        print(flush=True)
+
+        self.logger['batch_lens'] = []
+        self.logger['batch_rews'] = []
+        self.logger['actor_losses'] = []
+        
+        
+    def greedy(self, stocks, stock_idx, prod_size):
+            # TODO
+            stock = stocks[stock_idx]
+            stock_w, stock_h = self._get_stock_size_(stock)
+            prod_w, prod_h = prod_size
+
+            if stock_w >= prod_w and stock_h >= prod_h:
+                for x in range(stock_w - prod_w + 1):
+                    find = 0
+                    for y in range(stock_h - prod_h + 1):
+                        if stock[x][y] == -1:
+                            if find == 0:
+                                if self._can_place_(stock, (x, y), prod_size):
+                                    return {"stock_idx": stock_idx, "size": prod_size, "position": (x, y)}
+                                find = 1
+                        else:
+                            if find == 1:
+                                find = 0
+
+            if stock_w >= prod_h and stock_h >= prod_w:
+                for x in range(stock_w - prod_h + 1):
+                    find = 0
+                    for y in range(stock_h - prod_w + 1):
+                        if stock[x][y] == -1:
+                            if find == 0:
+                                if self._can_place_(stock, (x, y), prod_size[::-1]):
+                                    prod_size = prod_size[::-1]
+                                    return {"stock_idx": stock_idx, "size": prod_size[::-1], "position": (x, y)}
+                                find = 1
+                        else:
+                            if find == 1:
+                                find = 0
+
+            return {"stock_idx": -1, "size": [0, 0], "position": (0, 0)}
+    
+    def _get_stock_size_(self, stock):
+        stock_w = np.sum(np.any(stock != -2, axis=1))
+        stock_h = np.sum(np.any(stock != -2, axis=0))
+
+        return stock_w, stock_h
+
+    def _can_place_(self, stock, position, prod_size):
+        pos_x, pos_y = position
+        prod_w, prod_h = prod_size
+
+        return np.all(stock[pos_x : pos_x + prod_w, pos_y : pos_y + prod_h] == -1)
