@@ -115,6 +115,9 @@ class PPO:
             'batch_rews': [],
             'actor_losses': [],
         }
+        
+        self.stock_usage = {}  # Track stock usage
+
 
     def learn(self, total_timesteps):
         print(f"Learning... {self.max_timesteps_per_episode} steps/ep, {self.timesteps_per_batch} steps/batch, total {total_timesteps} steps")
@@ -185,6 +188,8 @@ class PPO:
                 torch.save(self.network.state_dict(), './ppo.pth')
 
     def rollout(self):
+        self.stock_usage = {}
+
         batch_obs = []
         batch_stocks = []
         batch_products = []
@@ -240,6 +245,7 @@ class PPO:
                 # Get action with masking
                 stock_action, product_action, log_prob = self.get_action(stocks_tensor, products_tensor, products_quantities_tensor)
 
+
                 # Store data
                 batch_obs.append(obs)
                 batch_stocks.append(stocks_np)
@@ -251,14 +257,24 @@ class PPO:
 
                 action = greedy(stocks_np, stock_action, products_np[product_action]['size'])
                 reward = 0
+                
+                if stock_action not in self.stock_usage:
+                    self.stock_usage[stock_action] = 0
+                self.stock_usage[stock_action] += 1
+                
+                # Apply usage penalty
+                usage_penalty = self.stock_usage[stock_action] * 5
+                reward -= usage_penalty
                 if self.is_new_stock(obs['stocks'][stock_action]):
-                    reward += 10
+                    reward += 50
                 
                 if action['stock_idx'] == -1 or products_np[product_action]['quantity'] == 0:
                     reward -= 100
                 else:
                     product_area = products_np[product_action]['size'][0] * products_np[product_action]['size'][1]
-                    reward += product_area * 0.1
+                    stock_area = self._get_stock_area(obs['stocks'][stock_action])
+                    efficiency_bonus = 20 * (product_area / stock_area) if stock_area > 0 else 0
+                    reward += 10 + efficiency_bonus
                 
                 obs, rew, terminated, truncated, info = self.env.step(action)
                 
@@ -317,6 +333,11 @@ class PPO:
     def get_action(self, stocks_tensor, products_tensor, products_quantities):
         # Forward pass through network
         stock_logits, product_logits, value = self.network(stocks_tensor, products_tensor)
+        
+        # Apply temperature annealing
+        temperature = max(1.0 - (self.logger['t_so_far'] / self.timesteps_per_batch), 0.1)
+        stock_logits = stock_logits / temperature
+        product_logits = product_logits / temperature
         
         # Apply mask to product logits
         product_mask = (products_quantities > 0).squeeze(0)  # Shape: (num_products,)
@@ -382,7 +403,7 @@ class PPO:
             torch.manual_seed(self.seed)
             print(f"Seed set to {self.seed}")
             
-        self.entropy_coef = 0.01  # Add entropy coefficient
+        self.entropy_coef = 0.05  # Add entropy coefficient
 
 
     def _log_summary(self):
@@ -423,6 +444,10 @@ class PPO:
             if product['quantity'] > 0:
                 return False
         return True
+    
+    def _get_stock_area(self, stock):
+        w, h = _get_stock_size_(stock)
+        return w * h
     
 def greedy(stocks, stock_idx, prod_size):
     # TODO
