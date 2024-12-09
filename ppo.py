@@ -262,14 +262,22 @@ class PPO:
                 
                 if action['stock_idx'] == -1 or products_np[product_action]['quantity'] == 0:
                     reward -= 10
+                else:
+                    product_area = products_np[product_action]['size'][0] * products_np[product_action]['size'][1]
+                    reward += product_area * 0.1
                 
                 obs, rew, terminated, truncated, info = self.env.step(action)
                 
                 done = terminated or truncated
                 if done:
                     if not self.fullfill(obs['products']):
-                        reward -= 10000
-                    reward -= 1000 * info['trim_loss']
+                        unfilled, total_products = 0, 0
+                        for product in obs['products']:
+                            total_products += 1
+                            if product['quantity'] > 0:
+                                unfilled += 1
+                        reward -= 100 * (total_products - unfilled)
+                    reward -= 100 * info['trim_loss']
                 ep_rews.append(reward)
                 t += 1
 
