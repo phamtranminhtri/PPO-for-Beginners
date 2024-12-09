@@ -252,7 +252,7 @@ class PPO:
                 action = greedy(stocks_np, stock_action, products_np[product_action]['size'])
                 reward = 0
                 if self.is_new_stock(obs['stocks'][stock_action]):
-                    reward -= 10
+                    reward += 10
                 
                 if action['stock_idx'] == -1 or products_np[product_action]['quantity'] == 0:
                     reward -= 100
