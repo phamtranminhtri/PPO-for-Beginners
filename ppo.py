@@ -199,7 +199,7 @@ class PPO:
             self._log_summary()
 
             if i_so_far % self.save_freq == 0:
-                torch.save(self.network.state_dict(), './ppo_cnn_policy_value.pth')
+                torch.save(self.network.state_dict(), './ppo.pth')
 
     def rollout(self):
         batch_obs = []
@@ -270,7 +270,7 @@ class PPO:
                     reward -= 10
                 
                 if action['stock_idx'] == -1 or products_np[product_action]['quantity'] == 0:
-                    reward -= 10
+                    reward -= 100
                 else:
                     product_area = products_np[product_action]['size'][0] * products_np[product_action]['size'][1]
                     reward += product_area * 0.1
