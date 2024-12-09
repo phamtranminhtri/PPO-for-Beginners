@@ -73,12 +73,21 @@ def test(env, actor_model):
 	num_stocks = len(observation["stocks"])
 	max_h, max_w = observation["stocks"][0].shape
 	num_products = len(observation["products"])
+ 
+	# Get device
+	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 	# Build our policy the same way we build our actor model in PPO
 	policy = PolicyValueNetwork(num_stocks=num_stocks, num_products=num_products)
+ 
+	# Load model with device mapping
+	policy.load_state_dict(torch.load(actor_model, map_location=device))
+	policy = policy.to(device)
+
 
 	# Load in the actor model saved by the PPO algorithm
-	policy.load_state_dict(torch.load(actor_model))
+	# policy.load_state_dict(torch.load(actor_model))
 
 	# Evaluate our policy with a separate module, eval_policy, to demonstrate
 	# that once we are done training the model/policy with ppo.py, we no longer need

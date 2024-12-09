@@ -260,7 +260,7 @@ class PPO:
                 if self.is_new_stock(obs['stocks'][stock_action]):
                     reward -= 10
                 
-                if action['stock_idx'] == -1:
+                if action['stock_idx'] == -1 or products_np[product_action]['quantity'] == 0:
                     reward -= 10
                 
                 obs, rew, terminated, truncated, info = self.env.step(action)
@@ -376,7 +376,7 @@ class PPO:
         i_so_far = self.logger['i_so_far']
         avg_ep_lens = np.mean(self.logger['batch_lens'])
         avg_ep_rews = np.mean([np.sum(ep_rews) for ep_rews in self.logger['batch_rews']])
-        avg_actor_loss = np.mean([losses.float().mean() for losses in self.logger['actor_losses']])
+        avg_actor_loss = np.mean([losses.cpu().float().mean() for losses in self.logger['actor_losses']])
 
         avg_ep_lens = str(round(avg_ep_lens, 2))
         avg_ep_rews = str(round(avg_ep_rews, 2))
