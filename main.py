@@ -72,7 +72,7 @@ def test(env, actor_model):
 	# Extract out dimensions of observation and action spacesv
 	num_stocks = len(observation["stocks"])
 	max_h, max_w = observation["stocks"][0].shape
-	num_products = len(observation["products"])
+	num_products = env.unwrapped.max_product_type
  
 	# Get device
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

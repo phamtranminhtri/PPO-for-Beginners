@@ -9,7 +9,7 @@
             "console": "integratedTerminal",
             "args": [
                 "--mode", "test",
-                "--actor_model", "ppo_cnn_policy_value.pth"
+                "--actor_model", "ppo.pth"
             ]
         }
     ]

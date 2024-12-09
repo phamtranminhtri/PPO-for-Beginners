@@ -56,6 +56,8 @@ def rollout(policy, env, render):
 	# Determine the device
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 	policy = policy.to(device)
+	
+	num_products = env.unwrapped.max_product_type
     
 	# Rollout until user kills process
 	while True:
@@ -79,22 +81,45 @@ def rollout(policy, env, render):
 			# Extract observation components
 			stocks_np = obs['stocks']  # shape (num_stocks, 100, 100)
 			products_np = obs['products']  # shape (num_products, 3)
+			# Extract numerical data from products_np
+			# Extract product features and quantities
 			products_list = []
+			products_quantities = []
 			for product in products_np:
-				size = product['size']  # numpy array, e.g., array([33, 42])
-				quantity = product['quantity']  # integer, e.g., 12
-				# Combine size and quantity into a single array
+				size = product['size']
+				quantity = product['quantity']
 				product_features = np.concatenate((size, [quantity]))
 				products_list.append(product_features)
-			products_array = np.array(products_list)  # Shape: (num_products, 3)
+				products_quantities.append(quantity)
 
-			# Convert to torch tensors
+			# Calculate padding length
+			pad_length = num_products - len(products_list)
+
+			# Pad both arrays if needed
+			if pad_length > 0:
+				products_list += [[0, 0, 0]] * pad_length
+				products_quantities += [0] * pad_length
+
+			# Convert to numpy arrays
+			products_array = np.array(products_list)  # Shape: (num_products, 3)
+			products_quantities = np.array(products_quantities)  # Shape: (num_products,)
+
+			# Convert to tensors
 			stocks_tensor = torch.tensor(np.array(stocks_np), dtype=torch.float).unsqueeze(0).to(device)
 			products_tensor = torch.tensor(products_array, dtype=torch.float).unsqueeze(0).to(device)
+			products_quantities_tensor = torch.tensor(products_quantities, dtype=torch.float).unsqueeze(0).to(device)
+			
+			# Get action with masking
+			# stock_action, product_action, log_prob = model.get_action(stocks_tensor, products_tensor, products_quantities_tensor)
 
 			# Query deterministic action from policy and run it
 			with torch.no_grad():
 				stock_logits, product_logits, _ = policy(stocks_tensor, products_tensor)
+
+				# Apply mask to product logits
+				product_mask = (products_quantities_tensor > 0).squeeze(0)  # Shape: (num_products,)
+				# Set logits of unavailable products to -inf
+				product_logits = product_logits.masked_fill(~product_mask, -float('inf'))
 
                 # Create distributions
 				stock_dist = Categorical(logits=stock_logits)
