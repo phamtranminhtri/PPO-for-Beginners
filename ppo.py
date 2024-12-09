@@ -94,12 +94,6 @@ class PPO:
         self._init_hyperparameters(hyperparameters)
         observation, _ = env.reset()
         self.env = env
-        
-        # Extract environment info
-        # Assuming environment provides these dimensions
-        # self.num_stocks = len(env.observation_space['stocks'])
-        # self.num_products = env.observation_space['products'].feature_space['quantity'].n
-        # self.max_w, self.max_h = env.observation_space['stocks'][0].shape
     
         self.num_stocks = len(observation["stocks"])
         self.max_h, self.max_w = observation["stocks"][0].shape
@@ -126,6 +120,8 @@ class PPO:
         print(f"Learning... {self.max_timesteps_per_episode} steps/ep, {self.timesteps_per_batch} steps/batch, total {total_timesteps} steps")
         t_so_far = 0
         i_so_far = 0
+        # Store initial learning rate
+        initial_lr = self.lr
         while t_so_far < total_timesteps:
             results = self.rollout()
             batch_obs, batch_stocks, batch_products, batch_acts, batch_log_probs, batch_rtgs, batch_lens, batch_products_quantities = results
@@ -136,18 +132,27 @@ class PPO:
             self.logger['i_so_far'] = i_so_far
 
             # Evaluate old actions and values
-            V, curr_log_probs = self.evaluate(batch_stocks, batch_products, batch_acts, batch_products_quantities)
+            V, curr_log_probs, _ = self.evaluate(batch_stocks, batch_products, batch_acts, batch_products_quantities)
             A_k = batch_rtgs - V.detach()
             A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
 
             # Update network
             for _ in range(self.n_updates_per_iteration):
+                # Learning rate annealing
+                frac = 1.0 - (t_so_far / total_timesteps)
+                new_lr = initial_lr * frac
+                new_lr = max(new_lr, 1e-7)  # Minimum learning rate
+                
+                # Update learning rates
+                self.actor_optim.param_groups[0]["lr"] = new_lr
+                self.critic_optim.param_groups[0]["lr"] = new_lr
+                
                 # o1 fix
                 # Zero gradients
                 self.actor_optim.zero_grad()
 
                 # Evaluate current values and log probabilities
-                V, curr_log_probs = self.evaluate(batch_stocks, batch_products, batch_acts, batch_products_quantities)
+                V, curr_log_probs, entropy = self.evaluate(batch_stocks, batch_products, batch_acts, batch_products_quantities)
 
                 # Calculate ratios
                 ratios = torch.exp(curr_log_probs - batch_log_probs)
@@ -159,9 +164,11 @@ class PPO:
                 # Compute actor and critic losses
                 actor_loss = (-torch.min(surr1, surr2)).mean()
                 critic_loss = nn.MSELoss()(V, batch_rtgs)
+                entropy_loss = -self.entropy_coef * entropy.mean()  # Negative because we want to maximize entropy
+
 
                 # Combine losses
-                total_loss = actor_loss + critic_loss
+                total_loss = actor_loss + critic_loss + entropy_loss
 
                 # Backward pass
                 total_loss.backward()
@@ -275,10 +282,6 @@ class PPO:
             batch_rews.append(ep_rews)
 
         # Convert to tensors
-        # batch_stocks = torch.tensor(np.array(batch_stocks), dtype=torch.float)   # (N, num_stocks, 100, 100)
-        # batch_products = torch.tensor(np.array(batch_products), dtype=torch.float) # (N, num_products, 3)
-        # batch_acts = torch.tensor(batch_acts, dtype=torch.long)          # (N, 2) where [:,0]=stock_id, [:,1]=product_id
-        # batch_log_probs = torch.tensor(batch_log_probs, dtype=torch.float)
 
         batch_rtgs = self.compute_rtgs(batch_rews)
         
@@ -342,7 +345,6 @@ class PPO:
         product_mask = (batch_products_quantities > 0)  # Shape: (batch_size, num_products)
         product_logits = product_logits.masked_fill(~product_mask, -float('inf'))
 
-
         stock_dist = Categorical(logits=stock_logits)
         product_dist = Categorical(logits=product_logits)
 
@@ -351,10 +353,14 @@ class PPO:
 
         stock_log_probs = stock_dist.log_prob(stock_actions)
         product_log_probs = product_dist.log_prob(product_actions)
+        
+        stock_entropy = stock_dist.entropy()
+        product_entropy = product_dist.entropy()
+        entropy = stock_entropy + product_entropy
 
         log_probs = stock_log_probs + product_log_probs
 
-        return value.squeeze(), log_probs
+        return value.squeeze(), log_probs, entropy
 
     def _init_hyperparameters(self, hyperparameters):
         self.timesteps_per_batch = 4800
@@ -375,6 +381,9 @@ class PPO:
         if self.seed is not None:
             torch.manual_seed(self.seed)
             print(f"Seed set to {self.seed}")
+            
+        self.entropy_coef = 0.01  # Add entropy coefficient
+
 
     def _log_summary(self):
         delta_t = self.logger['delta_t']
@@ -415,9 +424,6 @@ class PPO:
                 return False
         return True
     
-    
-        
-        
 def greedy(stocks, stock_idx, prod_size):
     # TODO
     stock = stocks[stock_idx]
