@@ -127,7 +127,8 @@ class PPO:
         t_so_far = 0
         i_so_far = 0
         while t_so_far < total_timesteps:
-            batch_obs, batch_stocks, batch_products, batch_acts, batch_log_probs, batch_rtgs, batch_lens = self.rollout()
+            results = self.rollout()
+            batch_obs, batch_stocks, batch_products, batch_acts, batch_log_probs, batch_rtgs, batch_lens, batch_products_quantities = results
 
             t_so_far += np.sum(batch_lens)
             i_so_far += 1
@@ -135,7 +136,7 @@ class PPO:
             self.logger['i_so_far'] = i_so_far
 
             # Evaluate old actions and values
-            V, curr_log_probs = self.evaluate(batch_stocks, batch_products, batch_acts)
+            V, curr_log_probs = self.evaluate(batch_stocks, batch_products, batch_acts, batch_products_quantities)
             A_k = batch_rtgs - V.detach()
             A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
 
@@ -166,7 +167,7 @@ class PPO:
                 self.actor_optim.zero_grad()
 
                 # Evaluate current values and log probabilities
-                V, curr_log_probs = self.evaluate(batch_stocks, batch_products, batch_acts)
+                V, curr_log_probs = self.evaluate(batch_stocks, batch_products, batch_acts, batch_products_quantities)
 
                 # Calculate advantages
                 # A_k = batch_rtgs - V.detach()
@@ -209,6 +210,7 @@ class PPO:
         batch_rews = []
         batch_rtgs = []
         batch_lens = []
+        batch_products_quantities = []
 
         t = 0
         while t < self.timesteps_per_batch:
@@ -246,7 +248,12 @@ class PPO:
                 stocks_tensor = torch.tensor(np.array(stocks_np), dtype=torch.float).unsqueeze(0).to(self.device)
                 products_tensor = torch.tensor(products_array, dtype=torch.float).unsqueeze(0).to(self.device)
 
-                stock_action, product_action, log_prob = self.get_action(stocks_tensor, products_tensor)
+                # Get products quantities
+                products_quantities = np.array([product['quantity'] for product in products_np])
+                products_quantities_tensor = torch.tensor(products_quantities, dtype=torch.float).unsqueeze(0).to(self.device)
+
+                # Get action with masking
+                stock_action, product_action, log_prob = self.get_action(stocks_tensor, products_tensor, products_quantities_tensor)
 
                 # Store data
                 batch_obs.append(obs)
@@ -254,6 +261,8 @@ class PPO:
                 batch_products.append(products_array)
                 batch_acts.append([stock_action, product_action])
                 batch_log_probs.append(log_prob)
+                batch_products_quantities.append(products_quantities) # Store quantities for masking
+
 
                 action = greedy(stocks_np, stock_action, products_np[product_action]['size'])
                 reward = 0
@@ -303,14 +312,18 @@ class PPO:
             batch_rtgs = batch_rtgs.clone().detach().float().to(self.device)
         else:
             batch_rtgs = torch.tensor(batch_rtgs, dtype=torch.float).to(self.device)
+            
+        batch_products_quantities = torch.tensor(np.array(batch_products_quantities), dtype=torch.float).to(self.device)
+
 
 
         # Logging
         self.logger['batch_rews'] = batch_rews
         self.logger['batch_lens'] = batch_lens
 
-        return batch_obs, batch_stocks, batch_products, batch_acts, batch_log_probs, batch_rtgs, batch_lens
-
+        return batch_obs, batch_stocks, batch_products, batch_acts, batch_log_probs, batch_rtgs, batch_lens, batch_products_quantities
+    
+    
     def compute_rtgs(self, batch_rews):
         batch_rtgs = []
         for ep_rews in reversed(batch_rews):
@@ -320,9 +333,15 @@ class PPO:
                 batch_rtgs.insert(0, discounted_reward)
         return torch.tensor(batch_rtgs, dtype=torch.float)
 
-    def get_action(self, stocks_tensor, products_tensor):
+    def get_action(self, stocks_tensor, products_tensor, products_quantities):
         # Forward pass through network
         stock_logits, product_logits, value = self.network(stocks_tensor, products_tensor)
+        
+        # Apply mask to product logits
+        product_mask = (products_quantities > 0).squeeze(0)  # Shape: (num_products,)
+        # Set logits of unavailable products to -inf
+        product_logits = product_logits.masked_fill(~product_mask, -float('inf'))
+
 
         # Create distributions
         stock_dist = Categorical(logits=stock_logits)
@@ -335,11 +354,16 @@ class PPO:
 
         return stock_action.item(), product_action.item(), log_prob.item()
 
-    def evaluate(self, batch_stocks, batch_products, batch_acts):
+    def evaluate(self, batch_stocks, batch_products, batch_acts, batch_products_quantities):
         # batch_stocks: (N, num_stocks, 100, 100)
         # batch_products: (N, num_products, 3)
         # batch_acts: (N, 2) where columns are stock_id, product_id
         stock_logits, product_logits, value = self.network(batch_stocks, batch_products)
+
+        # Apply mask to product logits
+        product_mask = (batch_products_quantities > 0)  # Shape: (batch_size, num_products)
+        product_logits = product_logits.masked_fill(~product_mask, -float('inf'))
+
 
         stock_dist = Categorical(logits=stock_logits)
         product_dist = Categorical(logits=product_logits)
