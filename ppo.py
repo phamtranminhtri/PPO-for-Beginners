@@ -103,7 +103,7 @@ class PPO:
     
         self.num_stocks = len(observation["stocks"])
         self.max_h, self.max_w = observation["stocks"][0].shape
-        self.num_products = len(observation["products"])
+        self.num_products = env.unwrapped.max_product_type
 
         # Initialize the combined policy-value network
         self.network = PolicyValueNetwork(num_stocks=self.num_stocks, num_products=self.num_products)
@@ -142,36 +142,12 @@ class PPO:
 
             # Update network
             for _ in range(self.n_updates_per_iteration):
-                # V, curr_log_probs = self.evaluate(batch_stocks, batch_products, batch_acts)
-
-                # ratios = torch.exp(curr_log_probs - batch_log_probs)
-                # surr1 = ratios * A_k
-                # surr2 = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * A_k
-
-                # actor_loss = (-torch.min(surr1, surr2)).mean()
-                # critic_loss = nn.MSELoss()(V, batch_rtgs)
-
-                # self.actor_optim.zero_grad()
-                # actor_loss.backward(retain_graph=True)
-                # self.actor_optim.step()
-
-                # self.critic_optim.zero_grad()
-                # critic_loss.backward()
-                # self.critic_optim.step()
-
-                # self.logger['actor_losses'].append(actor_loss.detach())
-                
-                
                 # o1 fix
                 # Zero gradients
                 self.actor_optim.zero_grad()
 
                 # Evaluate current values and log probabilities
                 V, curr_log_probs = self.evaluate(batch_stocks, batch_products, batch_acts, batch_products_quantities)
-
-                # Calculate advantages
-                # A_k = batch_rtgs - V.detach()
-                # A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
 
                 # Calculate ratios
                 ratios = torch.exp(curr_log_probs - batch_log_probs)
@@ -215,7 +191,7 @@ class PPO:
         t = 0
         while t < self.timesteps_per_batch:
             ep_rews = []
-            obs, _ = self.env.reset()
+            obs, _ = self.env.reset(seed=t)
             done = False
 
             for ep_t in range(self.max_timesteps_per_episode):
@@ -227,31 +203,33 @@ class PPO:
                 products_np = obs['products']  # shape (num_products, 3)
                 
                 # Extract numerical data from products_np
+                # Extract product features and quantities
                 products_list = []
+                products_quantities = []
                 for product in products_np:
-                    size = product['size']  # numpy array, e.g., array([33, 42])
-                    quantity = product['quantity']  # integer, e.g., 12
-                    # Combine size and quantity into a single array
+                    size = product['size']
+                    quantity = product['quantity']
                     product_features = np.concatenate((size, [quantity]))
                     products_list.append(product_features)
+                    products_quantities.append(quantity)
 
-                # Convert the list to a numpy array
+                # Calculate padding length
+                pad_length = self.num_products - len(products_list)
+
+                # Pad both arrays if needed
+                if pad_length > 0:
+                    products_list += [[0, 0, 0]] * pad_length
+                    products_quantities += [0] * pad_length
+
+                # Convert to numpy arrays
                 products_array = np.array(products_list)  # Shape: (num_products, 3)
+                products_quantities = np.array(products_quantities)  # Shape: (num_products,)
 
-                # Convert to torch tensor
-                # products_tensor = torch.tensor(products_array, dtype=torch.float).unsqueeze(0)  # Shape: (1, num_products, 3)
-
-                # # Convert to torch
-                # stocks_tensor = torch.tensor(np.array(stocks_np), dtype=torch.float).unsqueeze(0)    # (1, num_stocks, 100, 100)
-                # products_tensor = torch.tensor(products_np, dtype=torch.float).unsqueeze(0) # (1, num_products, 3)
-
+                # Convert to tensors
                 stocks_tensor = torch.tensor(np.array(stocks_np), dtype=torch.float).unsqueeze(0).to(self.device)
                 products_tensor = torch.tensor(products_array, dtype=torch.float).unsqueeze(0).to(self.device)
-
-                # Get products quantities
-                products_quantities = np.array([product['quantity'] for product in products_np])
                 products_quantities_tensor = torch.tensor(products_quantities, dtype=torch.float).unsqueeze(0).to(self.device)
-
+                
                 # Get action with masking
                 stock_action, product_action, log_prob = self.get_action(stocks_tensor, products_tensor, products_quantities_tensor)
 
@@ -436,6 +414,8 @@ class PPO:
             if product['quantity'] > 0:
                 return False
         return True
+    
+    
         
         
 def greedy(stocks, stock_idx, prod_size):
