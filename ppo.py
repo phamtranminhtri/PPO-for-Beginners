@@ -255,12 +255,22 @@ class PPO:
                 batch_acts.append([stock_action, product_action])
                 batch_log_probs.append(log_prob)
 
-                action = self.greedy(stocks_np, stock_action, products_np[product_action]['size'])
-
+                action = greedy(stocks_np, stock_action, products_np[product_action]['size'])
+                reward = 0
+                if self.is_new_stock(obs['stocks'][stock_action]):
+                    reward -= 10
+                
+                if action['stock_idx'] == -1:
+                    reward -= 10
+                
                 obs, rew, terminated, truncated, info = self.env.step(action)
-                rew = -info['trim_loss']
+                
                 done = terminated or truncated
-                ep_rews.append(rew)
+                if done:
+                    if not self.fullfill(obs['products']):
+                        reward -= 10000
+                    reward -= 1000 * info['trim_loss']
+                ep_rews.append(reward)
                 t += 1
 
                 if done:
@@ -281,7 +291,11 @@ class PPO:
         batch_products = torch.tensor(np.array(batch_products), dtype=torch.float).to(self.device) 
         batch_acts = torch.tensor(batch_acts, dtype=torch.long).to(self.device)
         batch_log_probs = torch.tensor(batch_log_probs, dtype=torch.float).to(self.device)
-        batch_rtgs = torch.tensor(batch_rtgs, dtype=torch.float).to(self.device)
+        if isinstance(batch_rtgs, torch.Tensor):
+            batch_rtgs = batch_rtgs.clone().detach().float().to(self.device)
+        else:
+            batch_rtgs = torch.tensor(batch_rtgs, dtype=torch.float).to(self.device)
+
 
         # Logging
         self.logger['batch_rews'] = batch_rews
@@ -382,50 +396,58 @@ class PPO:
         self.logger['batch_rews'] = []
         self.logger['actor_losses'] = []
         
-        
-    def greedy(self, stocks, stock_idx, prod_size):
-            # TODO
-            stock = stocks[stock_idx]
-            stock_w, stock_h = self._get_stock_size_(stock)
-            prod_w, prod_h = prod_size
-
-            if stock_w >= prod_w and stock_h >= prod_h:
-                for x in range(stock_w - prod_w + 1):
-                    find = 0
-                    for y in range(stock_h - prod_h + 1):
-                        if stock[x][y] == -1:
-                            if find == 0:
-                                if self._can_place_(stock, (x, y), prod_size):
-                                    return {"stock_idx": stock_idx, "size": prod_size, "position": (x, y)}
-                                find = 1
-                        else:
-                            if find == 1:
-                                find = 0
-
-            if stock_w >= prod_h and stock_h >= prod_w:
-                for x in range(stock_w - prod_h + 1):
-                    find = 0
-                    for y in range(stock_h - prod_w + 1):
-                        if stock[x][y] == -1:
-                            if find == 0:
-                                if self._can_place_(stock, (x, y), prod_size[::-1]):
-                                    prod_size = prod_size[::-1]
-                                    return {"stock_idx": stock_idx, "size": prod_size[::-1], "position": (x, y)}
-                                find = 1
-                        else:
-                            if find == 1:
-                                find = 0
-
-            return {"stock_idx": -1, "size": [0, 0], "position": (0, 0)}
+    def is_new_stock(self, stock):
+        return np.all(stock < 0)
     
-    def _get_stock_size_(self, stock):
-        stock_w = np.sum(np.any(stock != -2, axis=1))
-        stock_h = np.sum(np.any(stock != -2, axis=0))
+    def fullfill(self, products):
+        for product in products:
+            if product['quantity'] > 0:
+                return False
+        return True
+        
+        
+def greedy(stocks, stock_idx, prod_size):
+    # TODO
+    stock = stocks[stock_idx]
+    stock_w, stock_h = _get_stock_size_(stock)
+    prod_w, prod_h = prod_size
 
-        return stock_w, stock_h
+    if stock_w >= prod_w and stock_h >= prod_h:
+        for x in range(stock_w - prod_w + 1):
+            find = 0
+            for y in range(stock_h - prod_h + 1):
+                if stock[x][y] == -1:
+                    if find == 0:
+                        if _can_place_(stock, (x, y), prod_size):
+                            return {"stock_idx": stock_idx, "size": prod_size, "position": (x, y)}
+                        find = 1
+                else:
+                    if find == 1:
+                        find = 0
 
-    def _can_place_(self, stock, position, prod_size):
-        pos_x, pos_y = position
-        prod_w, prod_h = prod_size
+    if stock_w >= prod_h and stock_h >= prod_w:
+        for x in range(stock_w - prod_h + 1):
+            find = 0
+            for y in range(stock_h - prod_w + 1):
+                if stock[x][y] == -1:
+                    if find == 0:
+                        if _can_place_(stock, (x, y), prod_size[::-1]):
+                            return {"stock_idx": stock_idx, "size": prod_size[::-1], "position": (x, y)}
+                        find = 1
+                else:
+                    if find == 1:
+                        find = 0
 
-        return np.all(stock[pos_x : pos_x + prod_w, pos_y : pos_y + prod_h] == -1)
+    return {"stock_idx": -1, "size": [0, 0], "position": (0, 0)}
+
+def _get_stock_size_(stock):
+    stock_w = np.sum(np.any(stock != -2, axis=1))
+    stock_h = np.sum(np.any(stock != -2, axis=0))
+
+    return stock_w, stock_h
+
+def _can_place_(stock, position, prod_size):
+    pos_x, pos_y = position
+    prod_w, prod_h = prod_size
+
+    return np.all(stock[pos_x : pos_x + prod_w, pos_y : pos_y + prod_h] == -1)

@@ -119,8 +119,8 @@ def main(args):
     	"gym_cutting_stock/CuttingStock-v0", 
      	render_mode='human' if args.mode == 'test' else 'rgb_array',
 		num_stocks=16,
-		max_product_type=3,
-        max_product_per_type=5,
+		max_product_type=5,
+        max_product_per_type=10,
 	)
 
 	# Train or test, depending on the mode specified
