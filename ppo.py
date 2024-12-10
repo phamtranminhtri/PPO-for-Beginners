@@ -9,7 +9,7 @@ from torch.optim import Adam
 from torch.distributions import Categorical
 
 # ----------------------------------------------------
-# CNN-based PolicyValueNetwork as described previously
+# CNN-based Encoder Networks
 # ----------------------------------------------------
 class StockCNNEncoder(nn.Module):
     def __init__(self):
@@ -38,19 +38,21 @@ class ProductEncoder(nn.Module):
         x = F.relu(self.fc2(x))
         return x
 
-class PolicyValueNetwork(nn.Module):
+# ----------------------------------------------------
+# Actor Network
+# ----------------------------------------------------
+class ActorNetwork(nn.Module):
     def __init__(self, num_stocks=100, num_products=20):
-        super(PolicyValueNetwork, self).__init__()
+        super(ActorNetwork, self).__init__()
         self.num_stocks = num_stocks
         self.num_products = num_products
 
         self.stock_encoder = StockCNNEncoder()
         self.product_encoder = ProductEncoder()
 
-        # Policy and Value heads
+        # Policy heads
         self.stock_head = nn.Linear(160, num_stocks)
         self.product_head = nn.Linear(160, num_products)
-        self.value_head = nn.Linear(160, 1)
 
     def forward(self, stock_images, product_features):
         # stock_images: (B, num_stocks, 100, 100)
@@ -59,8 +61,7 @@ class PolicyValueNetwork(nn.Module):
         B = stock_images.size(0)
 
         # Process stocks
-        # Add a channel dimension: (B, num_stocks, 1, 100, 100)
-        stock_images = stock_images.unsqueeze(2)  # insert channel dimension
+        stock_images = stock_images.unsqueeze(2)  # (B, num_stocks, 1, 100, 100)
         stock_images = stock_images.view(B * self.num_stocks, 1, 100, 100)
         stock_embeds = self.stock_encoder(stock_images)  # (B*num_stocks, 128)
         stock_embeds = stock_embeds.view(B, self.num_stocks, 128)
@@ -77,13 +78,52 @@ class PolicyValueNetwork(nn.Module):
 
         stock_logits = self.stock_head(combined)       # (B, num_stocks)
         product_logits = self.product_head(combined)   # (B, num_products)
-        value = self.value_head(combined)              # (B, 1)
 
-        return stock_logits, product_logits, value
-
+        return stock_logits, product_logits
 
 # ----------------------------------------------------
-# PPO class modified to use the above CNN architecture
+# Critic Network
+# ----------------------------------------------------
+class CriticNetwork(nn.Module):
+    def __init__(self, num_stocks=100, num_products=20):
+        super(CriticNetwork, self).__init__()
+        self.num_stocks = num_stocks
+        self.num_products = num_products
+
+        self.stock_encoder = StockCNNEncoder()
+        self.product_encoder = ProductEncoder()
+
+        # Value head
+        self.value_head = nn.Linear(160, 1)
+
+    def forward(self, stock_images, product_features):
+        # stock_images: (B, num_stocks, 100, 100)
+        # product_features: (B, num_products, 3)
+
+        B = stock_images.size(0)
+
+        # Process stocks
+        stock_images = stock_images.unsqueeze(2)  # (B, num_stocks, 1, 100, 100)
+        stock_images = stock_images.view(B * self.num_stocks, 1, 100, 100)
+        stock_embeds = self.stock_encoder(stock_images)  # (B*num_stocks, 128)
+        stock_embeds = stock_embeds.view(B, self.num_stocks, 128)
+
+        # Process products
+        product_features = product_features.view(B * self.num_products, 3)
+        product_embeds = self.product_encoder(product_features)  # (B*num_products, 32)
+        product_embeds = product_embeds.view(B, self.num_products, 32)
+
+        # Aggregate
+        stock_summary = stock_embeds.mean(dim=1)     # (B, 128)
+        product_summary = product_embeds.mean(dim=1) # (B, 32)
+        combined = torch.cat([stock_summary, product_summary], dim=-1)  # (B, 160)
+
+        value = self.value_head(combined)              # (B, 1)
+
+        return value.squeeze(-1)  # (B,)
+
+# ----------------------------------------------------
+# PPO Class with Separate Actor and Critic Networks
 # ----------------------------------------------------
 class PPO:
     def __init__(self, env, **hyperparameters):
@@ -94,17 +134,18 @@ class PPO:
         self._init_hyperparameters(hyperparameters)
         observation, _ = env.reset()
         self.env = env
-    
+
         self.num_stocks = len(observation["stocks"])
         self.max_h, self.max_w = observation["stocks"][0].shape
         self.num_products = env.unwrapped.max_product_type
 
-        # Initialize the combined policy-value network
-        self.network = PolicyValueNetwork(num_stocks=self.num_stocks, num_products=self.num_products)
-        self.network.to(self.device)  # Move network to GPU
-    
-        self.actor_optim = Adam(self.network.parameters(), lr=self.lr)
-        self.critic_optim = Adam(self.network.parameters(), lr=self.lr)  # same network, but you could separate if desired
+        # Initialize Actor and Critic networks
+        self.actor = ActorNetwork(num_stocks=self.num_stocks, num_products=self.num_products).to(self.device)
+        self.critic = CriticNetwork(num_stocks=self.num_stocks, num_products=self.num_products).to(self.device)
+
+        # Initialize separate optimizers
+        self.actor_optim = Adam(self.actor.parameters(), lr=self.lr)
+        self.critic_optim = Adam(self.critic.parameters(), lr=self.lr)
 
         # Logger
         self.logger = {
@@ -114,6 +155,7 @@ class PPO:
             'batch_lens': [],
             'batch_rews': [],
             'actor_losses': [],
+            'critic_losses': [],
         }
         
         self.stock_usage = {}  # Track stock usage
@@ -135,11 +177,11 @@ class PPO:
             self.logger['i_so_far'] = i_so_far
 
             # Evaluate old actions and values
-            V, curr_log_probs, _ = self.evaluate(batch_stocks, batch_products, batch_acts, batch_products_quantities)
+            V = self.critic(batch_stocks, batch_products)
             A_k = batch_rtgs - V.detach()
             A_k = (A_k - A_k.mean()) / (A_k.std() + 1e-10)
 
-            # Update network
+            # Update networks
             for _ in range(self.n_updates_per_iteration):
                 # Learning rate annealing
                 frac = 1.0 - (t_so_far / total_timesteps)
@@ -147,45 +189,78 @@ class PPO:
                 new_lr = max(new_lr, 1e-7)  # Minimum learning rate
                 
                 # Update learning rates
-                self.actor_optim.param_groups[0]["lr"] = new_lr
-                self.critic_optim.param_groups[0]["lr"] = new_lr
+                for param_group in self.actor_optim.param_groups:
+                    param_group["lr"] = new_lr
+                for param_group in self.critic_optim.param_groups:
+                    param_group["lr"] = new_lr
                 
-                # o1 fix
                 # Zero gradients
                 self.actor_optim.zero_grad()
+                self.critic_optim.zero_grad()
 
-                # Evaluate current values and log probabilities
-                V, curr_log_probs, entropy = self.evaluate(batch_stocks, batch_products, batch_acts, batch_products_quantities)
+                # Forward pass through Actor
+                stock_logits, product_logits = self.actor(batch_stocks, batch_products)
 
-                # Calculate ratios
-                ratios = torch.exp(curr_log_probs - batch_log_probs)
+                # Apply temperature annealing
+                temperature = max(1.0 - (self.logger['t_so_far'] / self.timesteps_per_batch), 0.1)
+                stock_logits = stock_logits / temperature
+                product_logits = product_logits / temperature
 
-                # Calculate surrogate losses
+                # Apply mask to product logits
+                product_mask = (batch_products_quantities > 0)  # Shape: (batch_size, num_products)
+                product_logits = product_logits.masked_fill(~product_mask, -float('inf'))
+
+                # Create distributions
+                stock_dist = Categorical(logits=stock_logits)
+                product_dist = Categorical(logits=product_logits)
+
+                # Get log probabilities of the taken actions
+                stock_actions = batch_acts[:, 0]
+                product_actions = batch_acts[:, 1]
+                stock_log_probs = stock_dist.log_prob(stock_actions)
+                product_log_probs = product_dist.log_prob(product_actions)
+                log_probs = stock_log_probs + product_log_probs
+
+                # Ratios for PPO
+                ratios = torch.exp(log_probs - batch_log_probs)
+
+                # Surrogate losses
                 surr1 = ratios * A_k
                 surr2 = torch.clamp(ratios, 1 - self.clip, 1 + self.clip) * A_k
 
-                # Compute actor and critic losses
-                actor_loss = (-torch.min(surr1, surr2)).mean()
-                critic_loss = nn.MSELoss()(V, batch_rtgs)
-                entropy_loss = -self.entropy_coef * entropy.mean()  # Negative because we want to maximize entropy
+                # Actor loss
+                actor_loss = -torch.min(surr1, surr2).mean()
 
+                # Entropy for exploration
+                entropy = stock_dist.entropy() + product_dist.entropy()
+                entropy_loss = -self.entropy_coef * entropy.mean()
 
-                # Combine losses
-                total_loss = actor_loss + critic_loss + entropy_loss
+                # Total actor loss
+                total_actor_loss = actor_loss + entropy_loss
 
-                # Backward pass
-                total_loss.backward()
-
-                # Optimizer step
+                # Backward pass for Actor
+                total_actor_loss.backward()
                 self.actor_optim.step()
 
+                # Forward pass through Critic
+                values = self.critic(batch_stocks, batch_products)
+                critic_loss = F.mse_loss(values, batch_rtgs)
+
+                # Backward pass for Critic
+                critic_loss.backward()
+                self.critic_optim.step()
+
                 # Log the losses
-                self.logger['actor_losses'].append(actor_loss.detach())
+                self.logger['actor_losses'].append(actor_loss.detach().cpu().item())
+                self.logger['critic_losses'].append(critic_loss.detach().cpu().item())
 
             self._log_summary()
 
             if i_so_far % self.save_freq == 0:
-                torch.save(self.network.state_dict(), './ppo.pth')
+                torch.save({
+                    'actor_state_dict': self.actor.state_dict(),
+                    'critic_state_dict': self.critic.state_dict(),
+                }, './ppo_actor_critic.pth')
 
     def rollout(self):
         self.stock_usage = {}
@@ -331,8 +406,8 @@ class PPO:
         return torch.tensor(batch_rtgs, dtype=torch.float)
 
     def get_action(self, stocks_tensor, products_tensor, products_quantities):
-        # Forward pass through network
-        stock_logits, product_logits, value = self.network(stocks_tensor, products_tensor)
+        # Forward pass through Actor network
+        stock_logits, product_logits = self.actor(stocks_tensor, products_tensor)
         
         # Apply temperature annealing
         temperature = max(1.0 - (self.logger['t_so_far'] / self.timesteps_per_batch), 0.1)
@@ -357,10 +432,8 @@ class PPO:
         return stock_action.item(), product_action.item(), log_prob.item()
 
     def evaluate(self, batch_stocks, batch_products, batch_acts, batch_products_quantities):
-        # batch_stocks: (N, num_stocks, 100, 100)
-        # batch_products: (N, num_products, 3)
-        # batch_acts: (N, 2) where columns are stock_id, product_id
-        stock_logits, product_logits, value = self.network(batch_stocks, batch_products)
+        # Forward pass through Actor network
+        stock_logits, product_logits = self.actor(batch_stocks, batch_products)
 
         # Apply mask to product logits
         product_mask = (batch_products_quantities > 0)  # Shape: (batch_size, num_products)
@@ -381,7 +454,10 @@ class PPO:
 
         log_probs = stock_log_probs + product_log_probs
 
-        return value.squeeze(), log_probs, entropy
+        # Forward pass through Critic network
+        values = self.critic(batch_stocks, batch_products)
+
+        return values.squeeze(), log_probs, entropy
 
     def _init_hyperparameters(self, hyperparameters):
         self.timesteps_per_batch = 4800
@@ -403,8 +479,7 @@ class PPO:
             torch.manual_seed(self.seed)
             print(f"Seed set to {self.seed}")
             
-        self.entropy_coef = 0.05  # Add entropy coefficient
-
+        self.entropy_coef = 0.05  # Entropy coefficient for exploration
 
     def _log_summary(self):
         delta_t = self.logger['delta_t']
@@ -416,17 +491,20 @@ class PPO:
         i_so_far = self.logger['i_so_far']
         avg_ep_lens = np.mean(self.logger['batch_lens'])
         avg_ep_rews = np.mean([np.sum(ep_rews) for ep_rews in self.logger['batch_rews']])
-        avg_actor_loss = np.mean([losses.cpu().float().mean() for losses in self.logger['actor_losses']])
+        avg_actor_loss = np.mean(self.logger['actor_losses']) if self.logger['actor_losses'] else 0
+        avg_critic_loss = np.mean(self.logger['critic_losses']) if self.logger['critic_losses'] else 0
 
         avg_ep_lens = str(round(avg_ep_lens, 2))
         avg_ep_rews = str(round(avg_ep_rews, 2))
         avg_actor_loss = str(round(avg_actor_loss, 5))
+        avg_critic_loss = str(round(avg_critic_loss, 5))
 
         print(flush=True)
         print(f"-------------------- Iteration #{i_so_far} --------------------", flush=True)
         print(f"Average Episodic Length: {avg_ep_lens}", flush=True)
         print(f"Average Episodic Return: {avg_ep_rews}", flush=True)
-        print(f"Average Loss: {avg_actor_loss}", flush=True)
+        print(f"Average Actor Loss: {avg_actor_loss}", flush=True)
+        print(f"Average Critic Loss: {avg_critic_loss}", flush=True)
         print(f"Timesteps So Far: {t_so_far}", flush=True)
         print(f"Iteration took: {delta_t} secs", flush=True)
         print("------------------------------------------------------", flush=True)
@@ -435,6 +513,7 @@ class PPO:
         self.logger['batch_lens'] = []
         self.logger['batch_rews'] = []
         self.logger['actor_losses'] = []
+        self.logger['critic_losses'] = []
         
     def is_new_stock(self, stock):
         return np.all(stock < 0)
@@ -448,7 +527,7 @@ class PPO:
     def _get_stock_area(self, stock):
         w, h = _get_stock_size_(stock)
         return w * h
-    
+
 def greedy(stocks, stock_idx, prod_size):
     # TODO
     stock = stocks[stock_idx]

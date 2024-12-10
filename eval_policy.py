@@ -6,11 +6,6 @@
 	relying on ppo.py.
 """
 
-import torch
-import numpy as np
-from torch.distributions import Categorical
-from ppo import greedy
-
 def _log_summary(ep_len, ep_ret, ep_num):
 		"""
 			Print to stdout what we've logged so far in the most recent episode.
@@ -53,12 +48,6 @@ def rollout(policy, env, render):
 			If you're unfamiliar with Python "yield", check this out:
 				https://stackoverflow.com/questions/231767/what-does-the-yield-keyword-do
 	"""
-	# Determine the device
-	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-	policy = policy.to(device)
-	
-	num_products = env.unwrapped.max_product_type
-    
 	# Rollout until user kills process
 	while True:
 		obs, _ = env.reset()
@@ -77,65 +66,11 @@ def rollout(policy, env, render):
 			# Render environment if specified, off by default
 			if render:
 				env.render()
-    
-			# Extract observation components
-			stocks_np = obs['stocks']  # shape (num_stocks, 100, 100)
-			products_np = obs['products']  # shape (num_products, 3)
-			# Extract numerical data from products_np
-			# Extract product features and quantities
-			products_list = []
-			products_quantities = []
-			for product in products_np:
-				size = product['size']
-				quantity = product['quantity']
-				product_features = np.concatenate((size, [quantity]))
-				products_list.append(product_features)
-				products_quantities.append(quantity)
-
-			# Calculate padding length
-			pad_length = num_products - len(products_list)
-
-			# Pad both arrays if needed
-			if pad_length > 0:
-				products_list += [[0, 0, 0]] * pad_length
-				products_quantities += [0] * pad_length
-
-			# Convert to numpy arrays
-			products_array = np.array(products_list)  # Shape: (num_products, 3)
-			products_quantities = np.array(products_quantities)  # Shape: (num_products,)
-
-			# Convert to tensors
-			stocks_tensor = torch.tensor(np.array(stocks_np), dtype=torch.float).unsqueeze(0).to(device)
-			products_tensor = torch.tensor(products_array, dtype=torch.float).unsqueeze(0).to(device)
-			products_quantities_tensor = torch.tensor(products_quantities, dtype=torch.float).unsqueeze(0).to(device)
-			
-			# Get action with masking
-			# stock_action, product_action, log_prob = model.get_action(stocks_tensor, products_tensor, products_quantities_tensor)
 
 			# Query deterministic action from policy and run it
-			with torch.no_grad():
-				stock_logits, product_logits, _ = policy(stocks_tensor, products_tensor)
-
-				# Apply mask to product logits
-				product_mask = (products_quantities_tensor > 0).squeeze(0)  # Shape: (num_products,)
-				# Set logits of unavailable products to -inf
-				product_logits = product_logits.masked_fill(~product_mask, -float('inf'))
-
-                # Create distributions
-				stock_dist = Categorical(logits=stock_logits)
-				product_dist = Categorical(logits=product_logits)
-
-                # Sample actions
-				stock_action = stock_dist.sample().item()
-				product_action = product_dist.sample().item()
-
-            # **Prepare the action for the environment**
-			action = greedy(stocks_np, stock_action, products_np[product_action]['size'])
-
-            # **Step the environment**
+			action = policy(obs).detach().numpy()
 			obs, rew, terminated, truncated, _ = env.step(action)
-			done = terminated or truncated
-
+			done = terminated | truncated
 
 			# Sum all episodic rewards as we go along
 			ep_ret += rew

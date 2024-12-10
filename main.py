@@ -8,7 +8,7 @@ import sys
 import torch
 
 from arguments import get_args
-from ppo import PPO, PolicyValueNetwork
+from ppo_optimized import PPO, ActorNetwork, CriticNetwork
 from network import FeedForwardNN
 from eval_policy import eval_policy
 
@@ -31,16 +31,16 @@ def train(env, hyperparameters, actor_model, critic_model):
 
 	# Create a model for PPO.
 	model = PPO(env=env, **hyperparameters)
- 
-	# Determine device
-	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-	# Try to load existing model to continue training
-	if actor_model != '':
-		print(f"Loading model from {actor_model}...", flush=True)
-		model.network.load_state_dict(torch.load(actor_model, map_location=device))
+	# Tries to load in an existing actor/critic model to continue training on
+	if actor_model != '' and critic_model != '':
+		print(f"Loading in {actor_model} and {critic_model}...", flush=True)
+		model.actor.load_state_dict(torch.load(actor_model))
+		model.critic.load_state_dict(torch.load(critic_model))
 		print(f"Successfully loaded.", flush=True)
+	elif actor_model != '' or critic_model != '': # Don't train from scratch if user accidentally forgets actor/critic model
+		print(f"Error: Either specify both actor/critic models or none at all. We don't want to accidentally override anything!")
+		sys.exit(0)
 	else:
 		print(f"Training from scratch.", flush=True)
 
@@ -67,27 +67,17 @@ def test(env, actor_model):
 		print(f"Didn't specify model file. Exiting.", flush=True)
 		sys.exit(0)
 
+	# Extract out dimensions of observation and action spaces
 	observation, _ = env.reset()
-
-	# Extract out dimensions of observation and action spacesv
 	num_stocks = len(observation["stocks"])
 	max_h, max_w = observation["stocks"][0].shape
 	num_products = env.unwrapped.max_product_type
- 
-	# Get device
-	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
 	# Build our policy the same way we build our actor model in PPO
-	policy = PolicyValueNetwork(num_stocks=num_stocks, num_products=num_products)
- 
-	# Load model with device mapping
-	policy.load_state_dict(torch.load(actor_model, map_location=device))
-	policy = policy.to(device)
-
+	policy = ActorNetwork(num_stocks=num_stocks, num_products=num_products)
 
 	# Load in the actor model saved by the PPO algorithm
-	# policy.load_state_dict(torch.load(actor_model))
+	policy.load_state_dict(torch.load(actor_model))
 
 	# Evaluate our policy with a separate module, eval_policy, to demonstrate
 	# that once we are done training the model/policy with ppo.py, we no longer need
@@ -109,7 +99,7 @@ def main(args):
 	# ArgumentParser because it's too annoying to type them every time at command line. Instead, you can change them here.
 	# To see a list of hyperparameters, look in ppo.py at function _init_hyperparameters
 	hyperparameters = {
-				'timesteps_per_batch': 200, # prev 2048
+				'timesteps_per_batch': 200,#2048, 
 				'max_timesteps_per_episode': 200, 
 				'gamma': 0.99, 
 				'n_updates_per_iteration': 10,
@@ -121,16 +111,14 @@ def main(args):
 
 	# Creates the environment we'll be running. If you want to replace with your own
 	# custom environment, note that it must inherit Gym and have both continuous
-	# observation and action spaces.
-	# env = gym.make('Pendulum-v1', render_mode='human' if args.mode == 'test' else 'rgb_array')
-	# env = gym.make('LunarLander-v2', render_mode='human' if args.mode == 'test' else 'rgb_array')
+	# observation and action spaces.# Create the environment
 	env = gym.make(
-    	"gym_cutting_stock/CuttingStock-v0", 
-     	render_mode='human' if args.mode == 'test' else 'rgb_array',
-		num_stocks=16,
-		max_product_type=5,
+        "gym_cutting_stock/CuttingStock-v0", 
+        render_mode='human' if args.mode == 'test' else 'rgb_array',
+        num_stocks=16,
+        max_product_type=5,
         max_product_per_type=10,
-	)
+    )
 
 	# Train or test, depending on the mode specified
 	if args.mode == 'train':
