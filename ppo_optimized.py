@@ -466,11 +466,12 @@ class PPO:
 
                 # Calculate action and make a step in the env. 
                 # Note that rew is short for reward.    
-                action, log_prob = self.get_action(obs)
+                action, log_prob, product_index = self.get_action(obs)
                 val = self.critic(obs)
 
-                obs, rew, terminated, truncated, _ = self.env.step(action)
+                obs, rew, terminated, truncated, info = self.env.step(action)
                 done = terminated or truncated
+                rew = self.get_reward(obs, action, product_index, info, done)
                 # Track recent reward, action, and action log probability
                 ep_rews.append(rew)
                 ep_vals.append(val.flatten())
@@ -560,7 +561,7 @@ class PPO:
         action = greedy(obs['stocks'], stock_action.item(), products_size)
 
         # Return the sampled action and the log probability of that action in our distribution
-        return action, log_prob.detach()
+        return action, log_prob.detach(), product_action.item()
 
     def evaluate(self, batch_obs, batch_acts):
         """
@@ -684,7 +685,7 @@ class PPO:
         lr = self.logger['lr']
         avg_ep_lens = np.mean(self.logger['batch_lens'])
         avg_ep_rews = np.mean([np.sum(ep_rews) for ep_rews in self.logger['batch_rews']])
-        avg_actor_loss = np.mean([losses.float().mean() for losses in self.logger['actor_losses']])
+        avg_actor_loss = np.mean([losses.cpu().float().mean() for losses in self.logger['actor_losses']])
 
         # Round decimal places for more aesthetic logging messages
         avg_ep_lens = str(round(avg_ep_lens, 2))
@@ -738,6 +739,25 @@ class PPO:
         products_tensor = torch.tensor(products_array, dtype=torch.float).unsqueeze(0).to(self.device)
         
         return stocks_tensor, products_tensor
+    
+    def get_reward(self, obs, action, product_idx, info, done):
+        if action['stock_idx'] == -1 or action['size'] == [0, 0]:
+            return -10
+        
+        # if product quantity is 0
+        if obs['products'][product_idx]['quantity'] == 0:
+            return -10
+        
+        if done:
+            # placed all product successfully for product in obs['products']
+            for product in obs['products']:
+                if product['quantity'] != 0:
+                    return -50
+        
+            return (1 - info['trim_loss']) * 100
+        
+        return 1
+
     
 def greedy(stocks, stock_idx, prod_size):
     # TODO
