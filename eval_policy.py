@@ -6,6 +6,9 @@
 	relying on ppo.py.
 """
 
+from torch.distributions import Categorical
+from ppo_optimized import greedy
+
 def _log_summary(ep_len, ep_ret, ep_num):
 		"""
 			Print to stdout what we've logged so far in the most recent episode.
@@ -28,58 +31,67 @@ def _log_summary(ep_len, ep_ret, ep_num):
 		print(f"------------------------------------------------------", flush=True)
 		print(flush=True)
 
+
 def rollout(policy, env, render):
-	"""
-		Returns a generator to roll out each episode given a trained policy and
-		environment to test on. 
+    """
+    Returns a generator to roll out each episode with early stopping for invalid actions
+    """
+    MAX_INVALID_ACTIONS = 50  # Threshold for early stopping
+    
+    for ep in range(1000):
+        obs, _ = env.reset(seed=ep)
+        done = False
+        t = 0
+        ep_len = 0
+        ep_ret = 0
+        invalid_count = 0  # Track invalid actions
 
-		Parameters:
-			policy - The trained policy to test
-			env - The environment to evaluate the policy on
-			render - Specifies whether to render or not
-		
-		Return:
-			A generator object rollout, or iterable, which will return the latest
-			episodic length and return on each iteration of the generator.
+        while not done:
+            t += 1
 
-		Note:
-			If you're unfamiliar with Python generators, check this out:
-				https://wiki.python.org/moin/Generators
-			If you're unfamiliar with Python "yield", check this out:
-				https://stackoverflow.com/questions/231767/what-does-the-yield-keyword-do
-	"""
-	# Rollout until user kills process
-	while True:
-		obs, _ = env.reset()
-		done = False
+            if render:
+                env.render()
 
-		# number of timesteps so far
-		t = 0
+            # Get stock and product logits from policy
+            stock_logits, product_logits = policy(obs)
+            
+            # Create distributions and sample actions
+            stock_dist = Categorical(logits=stock_logits)
+            product_dist = Categorical(logits=product_logits)
+            stock_action = stock_dist.sample().cpu()
+            product_action = product_dist.sample().cpu()
 
-		# Logging data
-		ep_len = 0            # episodic length
-		ep_ret = 0            # episodic return
+            # Get product size
+            products_array = obs['products']
+            if product_action.item() < len(products_array):
+                products_size = [products_array[product_action.item()]['size'][0], 
+                               products_array[product_action.item()]['size'][1]]
+            else:
+                products_size = [0, 0]
 
-		while not done:
-			t += 1
+            # Get final action using greedy placement
+            action = greedy(obs['stocks'], stock_action.item(), products_size)
+            
+            # Check for invalid action
+            if action['stock_idx'] == -1:
+                invalid_count += 1
+                if invalid_count >= MAX_INVALID_ACTIONS:
+                    print(f"Early stopping due to {invalid_count} invalid actions")
+                    done = True
+                    ep_ret -= 1.0  # Penalty for too many invalid actions
+                    continue
 
-			# Render environment if specified, off by default
-			if render:
-				env.render()
+            # Execute action
+            obs, rew, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            
+            if done:
+                print(f"Amanzing! Episode {ep} finished in {t} steps")
 
-			# Query deterministic action from policy and run it
-			action = policy(obs).detach().numpy()
-			obs, rew, terminated, truncated, _ = env.step(action)
-			done = terminated | truncated
+            ep_ret += rew
 
-			# Sum all episodic rewards as we go along
-			ep_ret += rew
-			
-		# Track episodic length
-		ep_len = t
-
-		# returns episodic length and return in this iteration
-		yield ep_len, ep_ret
+        ep_len = t
+        yield ep_len, ep_ret
 
 def eval_policy(policy, env, render=False):
 	"""

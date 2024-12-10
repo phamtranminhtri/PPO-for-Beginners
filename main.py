@@ -15,39 +15,33 @@ from eval_policy import eval_policy
 import gym_cutting_stock
 
 def train(env, hyperparameters, actor_model, critic_model):
-	"""
-		Trains the model.
+    print(f"Training", flush=True)
 
-		Parameters:
-			env - the environment to train on
-			hyperparameters - a dict of hyperparameters to use, defined in main
-			actor_model - the actor model to load in if we want to continue training
-			critic_model - the critic model to load in if we want to continue training
+    # Determine device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
-		Return:
-			None
-	"""	
-	print(f"Training", flush=True)
+    # Create a model for PPO with device
+    model = PPO(env=env, **hyperparameters)
 
-	# Create a model for PPO.
-	model = PPO(env=env, **hyperparameters)
+    # Try loading existing models with proper device mapping
+    if actor_model != '' and critic_model != '':
+        print(f"Loading in {actor_model} and {critic_model}...", flush=True)
+        model.actor.load_state_dict(
+            torch.load(actor_model, map_location=device)
+        )
+        model.critic.load_state_dict(
+            torch.load(critic_model, map_location=device)
+        )
+        print(f"Successfully loaded.", flush=True)
+    elif actor_model != '' or critic_model != '':
+        print(f"Error: Either specify both actor/critic models or none at all.")
+        sys.exit(0)
+    else:
+        print(f"Training from scratch.", flush=True)
 
-	# Tries to load in an existing actor/critic model to continue training on
-	if actor_model != '' and critic_model != '':
-		print(f"Loading in {actor_model} and {critic_model}...", flush=True)
-		model.actor.load_state_dict(torch.load(actor_model))
-		model.critic.load_state_dict(torch.load(critic_model))
-		print(f"Successfully loaded.", flush=True)
-	elif actor_model != '' or critic_model != '': # Don't train from scratch if user accidentally forgets actor/critic model
-		print(f"Error: Either specify both actor/critic models or none at all. We don't want to accidentally override anything!")
-		sys.exit(0)
-	else:
-		print(f"Training from scratch.", flush=True)
-
-	# Train the PPO model with a specified total timesteps
-	# NOTE: You can change the total timesteps here, I put a big number just because
-	# you can kill the process whenever you feel like PPO is converging
-	model.learn(total_timesteps=200_000_000)
+    # Train the PPO model
+    model.learn(total_timesteps=200_000_000)
 
 def test(env, actor_model):
 	"""
@@ -66,6 +60,10 @@ def test(env, actor_model):
 	if actor_model == '':
 		print(f"Didn't specify model file. Exiting.", flush=True)
 		sys.exit(0)
+  
+	# Determine device
+	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+	print(f"Using device: {device}")
 
 	# Extract out dimensions of observation and action spaces
 	observation, _ = env.reset()
@@ -74,10 +72,15 @@ def test(env, actor_model):
 	num_products = env.unwrapped.max_product_type
 
 	# Build our policy the same way we build our actor model in PPO
-	policy = ActorNetwork(num_stocks=num_stocks, num_products=num_products)
+	policy = ActorNetwork(num_stocks=num_stocks, num_products=num_products).to(device)
 
-	# Load in the actor model saved by the PPO algorithm
-	policy.load_state_dict(torch.load(actor_model))
+	# Load model with appropriate device mapping
+	policy.load_state_dict(
+        torch.load(
+            actor_model,
+            map_location=device
+        )
+    )
 
 	# Evaluate our policy with a separate module, eval_policy, to demonstrate
 	# that once we are done training the model/policy with ppo.py, we no longer need
