@@ -256,6 +256,8 @@ class PPO:
         # Initialize optimizers for actor and critic
         self.actor_optim = Adam(self.actor.parameters(), lr=self.lr)
         self.critic_optim = Adam(self.critic.parameters(), lr=self.lr)
+        
+        self.max_invalid_actions = 50  # Threshold for early stopping
 
         # This logger will help us with printing out summaries of each iteration
         self.logger = {
@@ -266,6 +268,7 @@ class PPO:
             'batch_rews': [],       # episodic returns in batch
             'actor_losses': [],     # losses of actor network in current iteration
             'lr': 0,
+            'invalid_actions': []
         }
     def learn(self, total_timesteps):
         """
@@ -440,6 +443,7 @@ class PPO:
         ep_vals = []
         ep_dones = []
         t = 0 # Keeps track of how many timesteps we've run so far this batch
+        invalid_count = 0  # Track number of invalid actions
 
         # Keep simulating until we've run more than or equal to specified timesteps per batch
         while t < self.timesteps_per_batch:
@@ -467,10 +471,17 @@ class PPO:
                 # Calculate action and make a step in the env. 
                 # Note that rew is short for reward.    
                 action, log_prob, product_index = self.get_action(obs)
+                early_stop = False
+                if action['stock_idx'] == -1:
+                    invalid_count += 1
+                    if invalid_count >= self.max_invalid_actions:
+                        # Early stop this episode
+                        early_stop = True
+        
                 val = self.critic(obs)
 
                 obs, rew, terminated, truncated, info = self.env.step(action)
-                done = terminated or truncated
+                done = terminated or truncated or ep_t == self.max_timesteps_per_episode - 1 or early_stop
                 rew = self.get_reward(obs, action, product_index, info, done)
                 # Track recent reward, action, and action log probability
                 ep_rews.append(rew)
@@ -480,6 +491,8 @@ class PPO:
 
                 # If the environment tells us the episode is terminated, break
                 if done:
+                    self.logger['invalid_actions'].append(invalid_count)
+                    invalid_count = 0
                     break
 
             # Track episodic lengths, rewards, state values, and done flags
@@ -691,6 +704,9 @@ class PPO:
         avg_ep_lens = str(round(avg_ep_lens, 2))
         avg_ep_rews = str(round(avg_ep_rews, 2))
         avg_actor_loss = str(round(avg_actor_loss, 5))
+        
+        avg_invalid = np.mean(self.logger['invalid_actions']) if self.logger['invalid_actions'] else 0
+
 
         # Print logging statements
         print(flush=True)
@@ -701,6 +717,7 @@ class PPO:
         print(f"Timesteps So Far: {t_so_far}", flush=True)
         print(f"Iteration took: {delta_t} secs", flush=True)
         print(f"Learning rate: {lr}", flush=True)
+        print(f"Average Invalid Actions: {avg_invalid:.2f}", flush=True)
         print(f"------------------------------------------------------", flush=True)
         print(flush=True)
 
@@ -708,6 +725,7 @@ class PPO:
         self.logger['batch_lens'] = []
         self.logger['batch_rews'] = []
         self.logger['actor_losses'] = []
+        self.logger['invalid_actions'] = []
         
     # Added methods
     def extract(self, obs):
@@ -761,6 +779,9 @@ class PPO:
     
 def greedy(stocks, stock_idx, prod_size):
     # TODO
+    if prod_size == [0, 0]:
+        return {"stock_idx": -1, "size": [0, 0], "position": (0, 0)}
+    
     stock = stocks[stock_idx]
     stock_w, stock_h = _get_stock_size_(stock)
     prod_w, prod_h = prod_size
