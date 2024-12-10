@@ -23,14 +23,16 @@ import torch.nn.functional as F
 # CNN-based Encoder Networks
 # ----------------------------------------------------
 class StockCNNEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self, device):
         super(StockCNNEncoder, self).__init__()
         self.conv1 = nn.Conv2d(1, 32, kernel_size=8, stride=4)
         self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
         self.conv3 = nn.Conv2d(64, 64, kernel_size=3, stride=1)
         self.fc = nn.Linear(64 * 9 * 9, 128)  # Adjust if exact shape differs
+        self.device = device
 
     def forward(self, x):
+        x = x.to(self.device)
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
@@ -39,12 +41,14 @@ class StockCNNEncoder(nn.Module):
         return x
 
 class ProductEncoder(nn.Module):
-    def __init__(self, input_dim=3, hidden_dim=64, embed_dim=32):
+    def __init__(self, input_dim=3, hidden_dim=64, embed_dim=32, device=None):
         super(ProductEncoder, self).__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, embed_dim)
+        self.device = device
 
     def forward(self, prod_features):
+        prod_features = prod_features.to(self.device)
         x = F.relu(self.fc1(prod_features))
         x = F.relu(self.fc2(x))
         return x
@@ -53,17 +57,18 @@ class ProductEncoder(nn.Module):
 # Actor Network
 # ----------------------------------------------------
 class ActorNetwork(nn.Module):
-    def __init__(self, num_stocks=100, num_products=20):
+    def __init__(self, num_stocks=100, num_products=20, device=None):
         super(ActorNetwork, self).__init__()
+        self.device = device
         self.num_stocks = num_stocks
         self.num_products = num_products
 
-        self.stock_encoder = StockCNNEncoder()
-        self.product_encoder = ProductEncoder()
+        self.stock_encoder = StockCNNEncoder(device).to(device)
+        self.product_encoder = ProductEncoder(device=device).to(device)
 
         # Policy heads
-        self.stock_head = nn.Linear(160, num_stocks)
-        self.product_head = nn.Linear(160, num_products)
+        self.stock_head = nn.Linear(160, num_stocks).to(device)
+        self.product_head = nn.Linear(160, num_products).to(device)
 
     def forward(self, obs):
         """
@@ -75,7 +80,7 @@ class ActorNetwork(nn.Module):
         # Handle both single observations and batched observations
         if isinstance(obs, list):
             # Batch processing
-            stocks = torch.stack([torch.tensor(o['stocks'], dtype=torch.float) for o in obs])
+            stocks = torch.stack([torch.tensor(np.array(o['stocks']), dtype=torch.float) for o in obs]).to(self.device)
             products_list = []
             for o in obs:
                 prod_features = []
@@ -88,10 +93,10 @@ class ActorNetwork(nn.Module):
                 if pad_length > 0:
                     prod_features += [[0, 0, 0]] * pad_length
                 products_list.append(prod_features)
-            products = torch.tensor(np.array(products_list), dtype=torch.float)
+            products = torch.tensor(np.array(products_list), dtype=torch.float).to(self.device)
         else:
             # Single observation processing
-            stocks = torch.tensor(obs['stocks'], dtype=torch.float).unsqueeze(0)
+            stocks = torch.tensor(np.array(obs['stocks']), dtype=torch.float).unsqueeze(0).to(self.device)
             # Process products
             products_list = []
             for product in obs['products']:
@@ -102,7 +107,7 @@ class ActorNetwork(nn.Module):
             pad_length = self.num_products - len(products_list)
             if pad_length > 0:
                 products_list += [[0, 0, 0]] * pad_length
-            products = torch.tensor(np.array([products_list]), dtype=torch.float)
+            products = torch.tensor(np.array([products_list]), dtype=torch.float).to(self.device)
 
         B = stocks.size(0)
         
@@ -135,16 +140,18 @@ class ActorNetwork(nn.Module):
 # Critic Network
 # ----------------------------------------------------
 class CriticNetwork(nn.Module):
-    def __init__(self, num_stocks=100, num_products=20):
+    def __init__(self, num_stocks=100, num_products=20, device=None):
         super(CriticNetwork, self).__init__()
+        self.device = device
+        
         self.num_stocks = num_stocks
         self.num_products = num_products
 
-        self.stock_encoder = StockCNNEncoder()
-        self.product_encoder = ProductEncoder()
+        self.stock_encoder = StockCNNEncoder(device).to(device)
+        self.product_encoder = ProductEncoder(device=device).to(device)
 
         # Value head
-        self.value_head = nn.Linear(160, 1)
+        self.value_head = nn.Linear(160, 1).to(device)
 
     def forward(self, obs):
         """
@@ -156,7 +163,7 @@ class CriticNetwork(nn.Module):
         # Handle both single observations and batched observations
         if isinstance(obs, list):
             # Batch processing
-            stocks = torch.stack([torch.tensor(o['stocks'], dtype=torch.float) for o in obs])
+            stocks = torch.stack([torch.tensor(np.array(o['stocks']), dtype=torch.float) for o in obs]).to(self.device)
             products_list = []
             for o in obs:
                 prod_features = []
@@ -169,10 +176,10 @@ class CriticNetwork(nn.Module):
                 if pad_length > 0:
                     prod_features += [[0, 0, 0]] * pad_length
                 products_list.append(prod_features)
-            products = torch.tensor(np.array(products_list), dtype=torch.float)
+            products = torch.tensor(np.array(products_list), dtype=torch.float).to(self.device)
         else:
             # Single observation processing
-            stocks = torch.tensor(obs['stocks'], dtype=torch.float).unsqueeze(0)
+            stocks = torch.tensor(np.array(obs['stocks']), dtype=torch.float).unsqueeze(0).to(self.device)
             # Process products
             products_list = []
             for product in obs['products']:
@@ -183,7 +190,7 @@ class CriticNetwork(nn.Module):
             pad_length = self.num_products - len(products_list)
             if pad_length > 0:
                 products_list += [[0, 0, 0]] * pad_length
-            products = torch.tensor(np.array([products_list]), dtype=torch.float)
+            products = torch.tensor(np.array([products_list]), dtype=torch.float).to(self.device)
 
         B = stocks.size(0)
         
@@ -243,8 +250,8 @@ class PPO:
         self.num_products = env.unwrapped.max_product_type
 
         # Initialize actor and critic networks
-        self.actor = ActorNetwork(num_stocks=self.num_stocks, num_products=self.num_products).to(self.device)
-        self.critic = CriticNetwork(num_stocks=self.num_stocks, num_products=self.num_products).to(self.device)
+        self.actor = ActorNetwork(num_stocks=self.num_stocks, num_products=self.num_products, device=self.device).to(self.device)
+        self.critic = CriticNetwork(num_stocks=self.num_stocks, num_products=self.num_products, device=self.device).to(self.device)
 
         # Initialize optimizers for actor and critic
         self.actor_optim = Adam(self.actor.parameters(), lr=self.lr)
@@ -325,9 +332,9 @@ class PPO:
                     # Extract data at the sampled indices
                     mini_obs = [batch_obs[i] for i in idx]  # Changed indexing for list
                     mini_acts = [batch_acts[i] for i in idx]  # Changed indexing for list
-                    mini_log_prob = batch_log_probs[idx]
-                    mini_advantage = A_k[idx]
-                    mini_rtgs = batch_rtgs[idx]
+                    mini_log_prob = batch_log_probs[idx].to(self.device)
+                    mini_advantage = A_k[idx].to(self.device)
+                    mini_rtgs = batch_rtgs[idx].to(self.device)
 
                     # Calculate V_phi and pi_theta(a_t | s_t) and entropy
                     V, curr_log_probs, entropy = self.evaluate(mini_obs, mini_acts)
@@ -414,7 +421,7 @@ class PPO:
             batch_advantages.extend(advantages)
 
         # Convert the batch_advantages list to a PyTorch tensor of type float
-        return torch.tensor(batch_advantages, dtype=torch.float)
+        return torch.tensor(batch_advantages, dtype=torch.float).to(self.device)
 
 
     def rollout(self):
@@ -526,8 +533,8 @@ class PPO:
         products_array = np.array(products_list)  # Shape: (num_products, 3)
 
         # Convert to tensors
-        stocks_tensor = torch.tensor(np.array(stocks_np), dtype=torch.float).unsqueeze(0).to(self.device)
-        products_tensor = torch.tensor(products_array, dtype=torch.float).unsqueeze(0).to(self.device)
+        # stocks_tensor = torch.tensor(np.array(stocks_np), dtype=torch.float).unsqueeze(0).to(self.device)
+        # products_tensor = torch.tensor(products_array, dtype=torch.float).unsqueeze(0).to(self.device)
         
         # Query the actor network for a mean action
         stock_logits, product_logits = self.actor(obs)
@@ -542,6 +549,11 @@ class PPO:
 
         # Calculate the log probability for that action
         log_prob = stock_dist.log_prob(stock_action) + product_dist.log_prob(product_action)
+
+        # Move action results back to CPU for numpy operations
+        stock_action = stock_action.cpu()
+        product_action = product_action.cpu()
+        log_prob = log_prob.cpu()
 
         # Product size [w, h]
         products_size = [products_array[product_action.item()][0], products_array[product_action.item()][1]]
