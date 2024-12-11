@@ -9,7 +9,6 @@ import torch
 
 from arguments import get_args
 from ppo_optimized import PPO, ActorNetwork, CriticNetwork
-from network import FeedForwardNN
 from eval_policy import eval_policy
 
 import gym_cutting_stock
@@ -19,7 +18,7 @@ def train(env, hyperparameters, actor_model, critic_model):
 
     # Determine device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # print(f"Using device: {device}")
 
     # Create a model for PPO with device
     model = PPO(env=env, **hyperparameters)

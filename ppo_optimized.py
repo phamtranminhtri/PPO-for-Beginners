@@ -248,6 +248,8 @@ class PPO:
         self.num_stocks = len(observation["stocks"])
         self.max_h, self.max_w = observation["stocks"][0].shape
         self.num_products = env.unwrapped.max_product_type
+        self.min_h = env.unwrapped.min_h
+        self.min_w = env.unwrapped.min_w
 
         # Initialize actor and critic networks
         self.actor = ActorNetwork(num_stocks=self.num_stocks, num_products=self.num_products, device=self.device).to(self.device)
@@ -256,8 +258,6 @@ class PPO:
         # Initialize optimizers for actor and critic
         self.actor_optim = Adam(self.actor.parameters(), lr=self.lr)
         self.critic_optim = Adam(self.critic.parameters(), lr=self.lr)
-        
-        self.max_invalid_actions = 50  # Threshold for early stopping
 
         # This logger will help us with printing out summaries of each iteration
         self.logger = {
@@ -268,8 +268,9 @@ class PPO:
             'batch_rews': [],       # episodic returns in batch
             'actor_losses': [],     # losses of actor network in current iteration
             'lr': 0,
-            'invalid_actions': []
         }
+        
+        self.max_product_area = self.min_h * self.min_w
     def learn(self, total_timesteps):
         """
             Train the actor and critic networks. Here is where the main PPO algorithm resides.
@@ -443,15 +444,14 @@ class PPO:
         ep_vals = []
         ep_dones = []
         t = 0 # Keeps track of how many timesteps we've run so far this batch
-        invalid_count = 0  # Track number of invalid actions
 
         # Keep simulating until we've run more than or equal to specified timesteps per batch
         while t < self.timesteps_per_batch:
             ep_rews = [] # rewards collected per episode
             ep_vals = [] # state values collected per episode
             ep_dones = [] # done flag collected per episode
-            # Reset the environment. Note that obs is short for observation. 
-            obs, _ = self.env.reset(seed=t)
+            # Reset the environment. Note that obs is short for observation. Set set to random seed 
+            obs, _ = self.env.reset(seed=None)
             # Initially, the game is not done
             done = False
 
@@ -470,19 +470,13 @@ class PPO:
 
                 # Calculate action and make a step in the env. 
                 # Note that rew is short for reward.    
-                action, log_prob, product_index = self.get_action(obs)
-                early_stop = False
-                if action['stock_idx'] == -1:
-                    invalid_count += 1
-                    if invalid_count >= self.max_invalid_actions:
-                        # Early stop this episode
-                        early_stop = True
+                action, log_prob, product_index, new_stock = self.get_action(obs)
         
                 val = self.critic(obs)
 
                 obs, rew, terminated, truncated, info = self.env.step(action)
-                done = terminated or truncated or ep_t == self.max_timesteps_per_episode - 1 or early_stop
-                rew = self.get_reward(obs, action, product_index, info, done)
+                done = terminated or truncated or ep_t == self.max_timesteps_per_episode - 1
+                rew = self.get_reward(obs, action, product_index, info, done, new_stock)
                 # Track recent reward, action, and action log probability
                 ep_rews.append(rew)
                 ep_vals.append(val.flatten())
@@ -491,8 +485,6 @@ class PPO:
 
                 # If the environment tells us the episode is terminated, break
                 if done:
-                    self.logger['invalid_actions'].append(invalid_count)
-                    invalid_count = 0
                     break
 
             # Track episodic lengths, rewards, state values, and done flags
@@ -552,14 +544,26 @@ class PPO:
         
         # Query the actor network for a mean action
         stock_logits, product_logits = self.actor(obs)
+        
+        # Mask out products whose quantity is 0
+        for i, product in enumerate(products_array):
+            if product[2] == 0:
+                product_logits[0][i] = -float('inf')
 
         # Create distributions
-        stock_dist = Categorical(logits=stock_logits)
-        product_dist = Categorical(logits=product_logits)
-
         # Sample an action from the distribution
-        stock_action = stock_dist.sample()
+        product_dist = Categorical(logits=product_logits)
         product_action = product_dist.sample()
+        products_size = [products_array[product_action.item()][0], products_array[product_action.item()][1]]
+
+        # Mask out stocks where product won't fit
+        for i, stock in enumerate(stocks_np):
+            act = greedy(obs['stocks'], i, products_size)
+            if act['stock_idx'] == -1:
+                stock_logits[0][i] = -float('inf')
+
+        stock_dist = Categorical(logits=stock_logits)
+        stock_action = stock_dist.sample()
 
         # Calculate the log probability for that action
         log_prob = stock_dist.log_prob(stock_action) + product_dist.log_prob(product_action)
@@ -570,11 +574,12 @@ class PPO:
         log_prob = log_prob.cpu()
 
         # Product size [w, h]
-        products_size = [products_array[product_action.item()][0], products_array[product_action.item()][1]]
         action = greedy(obs['stocks'], stock_action.item(), products_size)
+        
+        is_new_stock = np.all(stocks_np[stock_action.item()] < 0)
 
         # Return the sampled action and the log probability of that action in our distribution
-        return action, log_prob.detach(), product_action.item()
+        return action, log_prob.detach(), product_action.item(), is_new_stock
 
     def evaluate(self, batch_obs, batch_acts):
         """
@@ -651,7 +656,7 @@ class PPO:
         self.clip = 0.2                                 # Recommended 0.2, helps define the threshold to clip the ratio during SGA
         self.lam = 0.98                                 # Lambda Parameter for GAE 
         self.num_minibatches = 6                        # Number of mini-batches for Mini-batch Update
-        self.ent_coef = 0                               # Entropy coefficient for Entropy Regularization
+        self.ent_coef = 0.01                            # Entropy coefficient for Entropy Regularization
         self.target_kl = 0.02                           # KL Divergence threshold
         self.max_grad_norm = 0.5                        # Gradient Clipping threshold
 
@@ -704,8 +709,6 @@ class PPO:
         avg_ep_lens = str(round(avg_ep_lens, 2))
         avg_ep_rews = str(round(avg_ep_rews, 2))
         avg_actor_loss = str(round(avg_actor_loss, 5))
-        
-        avg_invalid = np.mean(self.logger['invalid_actions']) if self.logger['invalid_actions'] else 0
 
 
         # Print logging statements
@@ -717,7 +720,6 @@ class PPO:
         print(f"Timesteps So Far: {t_so_far}", flush=True)
         print(f"Iteration took: {delta_t} secs", flush=True)
         print(f"Learning rate: {lr}", flush=True)
-        print(f"Average Invalid Actions: {avg_invalid:.2f}", flush=True)
         print(f"------------------------------------------------------", flush=True)
         print(flush=True)
 
@@ -725,7 +727,6 @@ class PPO:
         self.logger['batch_lens'] = []
         self.logger['batch_rews'] = []
         self.logger['actor_losses'] = []
-        self.logger['invalid_actions'] = []
         
     # Added methods
     def extract(self, obs):
@@ -758,23 +759,55 @@ class PPO:
         
         return stocks_tensor, products_tensor
     
-    def get_reward(self, obs, action, product_idx, info, done):
-        if action['stock_idx'] == -1 or action['size'] == [0, 0]:
-            return -10
+    # def get_reward(self, obs, action, product_idx, info, done, new_stock):
+    #     if action['stock_idx'] == -1 or action['size'] == [0, 0]:
+    #         return -10
         
-        # if product quantity is 0
-        if obs['products'][product_idx]['quantity'] == 0:
-            return -10
+    #     if not new_stock:
+    #         return 5
         
+    #     if done:
+    #         # placed all product successfully for product in obs['products']
+    #         for product in obs['products']:
+    #             if product['quantity'] != 0:
+    #                 return -50
+        
+    #         return -info['trim_loss'] * 100
+        
+    #     return 0
+    
+    def get_reward(self, obs, action, product_idx, info, done, new_stock):
+        """
+        Adjusted reward structure for better learning signals.
+        """
+        # Remove invalid action penalty (since invalid actions are masked)
+
+        # Calculate placement efficiency
+        product_area = action['size'][0] * action['size'][1]
+        # Set this to the actual maximum product area
+        area_ratio = product_area / self.max_product_area
+
+        if new_stock:
+            # Penalize starting new stock moderately
+            base_reward = -10.0
+        else:
+            # Reward using existing stock
+            base_reward = 10.0
+        
+        # Scale reward by area ratio
+        placement_reward = base_reward + area_ratio * 10.0  # Adjusted scaling
+
         if done:
-            # placed all product successfully for product in obs['products']
-            for product in obs['products']:
-                if product['quantity'] != 0:
-                    return -50
-        
-            return (1 - info['trim_loss']) * 100
-        
-        return 1
+            # Check for incomplete products
+            incomplete = any(p['quantity'] != 0 for p in obs['products'])
+            if incomplete:
+                return placement_reward - 100.0  # Adjusted penalty
+            else:
+                # Bonus for completion with emphasis on efficiency
+                efficiency_bonus = (1.0 - info['trim_loss']) * 200.0  # Adjusted scaling
+                return placement_reward + efficiency_bonus
+
+        return placement_reward
 
     
 def greedy(stocks, stock_idx, prod_size):
